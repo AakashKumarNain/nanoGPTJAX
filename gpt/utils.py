@@ -1,5 +1,4 @@
 import dataclasses
-from functools import partial
 from typing import Callable, Tuple
 
 import jax
@@ -54,7 +53,9 @@ def logical_to_physical(logical: Axes, rules) -> jax.sharding.PartitionSpec:
     return P(*spec)
 
 
-def logical_to_sharding(logical: Axes, mesh: jax.sharding.Mesh, rules) -> jax.sharding.Sharding:
+def logical_to_sharding(
+    logical: Axes, mesh: jax.sharding.Mesh, rules
+) -> jax.sharding.Sharding:
     """Returns the sharding for a given sequence of logical array dimensions (i.e. the logical shape of an array)."""
     assert mesh is not None
     return NamedSharding(mesh, logical_to_physical(logical, rules))
@@ -108,8 +109,10 @@ def _initialize_parameter_leaves(key, specs, shardings):
     # Init one leaf at a time instead of a big jitted graph. The compile time would go crazy.
     # TODO: There may be some gotchas here, but I am not noticing anything weird for now. Keep an eye on it!
     def init_one(k, spec, sharding):
-        return jax.jit(spec.initializer, out_shardings=sharding, static_argnums=(1, 2))(k, spec.shape, spec.dtype)
-    
+        return jax.jit(spec.initializer, out_shardings=sharding, static_argnums=(1, 2))(
+            k, spec.shape, spec.dtype
+        )
+
     return tuple(init_one(k, s, sh) for k, s, sh in zip(keys, specs, shardings))
 
 
