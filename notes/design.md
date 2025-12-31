@@ -25,7 +25,7 @@ Though there are many valid design choices for building an abstraction, I do not
 
 This design cleanly separates “what to create” (parameter specifications), “where to put it” (sharding), and “how to create it” (initialization). That separation is the core abstraction that lets you write simple layer definitions and then scale them across devices without changing layer code.
 
-We only need two classes to achieve all of this, defined in the `layer_utils.py` file.
+We only need two classes to achieve all of this, defined in the `utils.py` file.
 
 - **ParamSpec:** Defines the specification of JAX arrays we want to create. It stores the following abstract information about our arrays:
     - *shape*: shape of the array
