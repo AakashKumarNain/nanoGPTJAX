@@ -30,7 +30,8 @@ class Linear(ParamInitializer):
             shape=(cfg.in_features, cfg.out_features),
             dtype=cfg.dtype,
             logical_axes=cfg.weight_logical_axes,
-            initializer=cfg.weight_initializer or linear_init(cfg.in_features, cfg.out_features),
+            initializer=cfg.weight_initializer
+            or linear_init(cfg.in_features, cfg.out_features),
         )
         if cfg.use_bias:
             bias = ParamSpec(
@@ -126,9 +127,13 @@ class Embedding(ParamInitializer):
             shape=(cfg.vocab_size, cfg.d_emb),
             dtype=cfg.dtype,
             logical_axes=cfg.weight_logical_axes,
-            initializer=cfg.weight_initializer or embed_init ,
+            initializer=cfg.weight_initializer or embed_init,
         )
-        return Embedding(vocab_size=cfg.vocab_size, d_emb=cfg.d_emb, weight=weight,)
+        return Embedding(
+            vocab_size=cfg.vocab_size,
+            d_emb=cfg.d_emb,
+            weight=weight,
+        )
 
     @classmethod
     def init(cls, key, mesh, rules, cfg):
