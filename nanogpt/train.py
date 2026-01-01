@@ -29,7 +29,6 @@ import orbax.checkpoint as ocp
 from jax.sharding import PartitionSpec as P
 from jax.sharding import Mesh
 from jax.sharding import set_mesh
-from jax.sharding import NamedSharding
 
 from model import GPT
 from utils import logical_to_sharding
@@ -38,43 +37,6 @@ from config import ShardingRules, Config, BATCH_AXIS_NAME
 
 logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
-
-
-def get_sharding_for_checkpoint(x, mesh):
-    if hasattr(x, "ndim") and x.ndim == 0:
-        return NamedSharding(mesh, P())
-    if isinstance(x, jax.Array) and hasattr(x, "sharding"):
-        return x.sharding
-    else:
-        return NamedSharding(mesh, P())
-
-
-def load_checkpoint(mngr, step, model, optim_state, mesh):
-    params_item, params_transforms = model, None
-    optim_item, optim_transforms = optim_state, None  #
-    params_restore_args = jax.tree.map(
-        lambda s: ocp.ArrayRestoreArgs(sharding=get_sharding_for_checkpoint(s, mesh)),
-        model,
-    )
-    optim_restore_args = jax.tree.map(
-        lambda s: ocp.ArrayRestoreArgs(sharding=get_sharding_for_checkpoint(s, mesh)),
-        optim_state,
-    )
-    restore_items = ocp.args.Composite(
-        params=ocp.args.PyTreeRestore(
-            item=params_item,
-            transforms=params_transforms,
-            restore_args=params_restore_args,
-        ),
-        optim_state=ocp.args.PyTreeRestore(
-            item=optim_state,
-            transforms=optim_transforms,
-            restore_args=optim_restore_args,
-        ),
-    )
-    restored = mngr.restore(step, args=restore_items)
-    print(f"Restoring checkpoint from step {step} is complete!")
-    return restored.params, restored.optim_state
 
 
 def count_params(model):
@@ -298,8 +260,7 @@ optim_state = optim.init(model)
 # Checkpointing
 ckpt_path = Path(cfg.ckpt_dir)
 options = ocp.CheckpointManagerOptions(
-    max_to_keep=max_checkpoints_to_keep,
-    save_interval_steps=checkpoint_save_steps
+    max_to_keep=max_checkpoints_to_keep, save_interval_steps=checkpoint_save_steps
 )
 handlers = {
     "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
