@@ -14,7 +14,6 @@ os.environ.update(
 
 import warnings
 import logging
-import math
 from pathlib import Path
 
 import time
@@ -26,150 +25,18 @@ import jax
 import numpy as np
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
-from jax.sharding import PartitionSpec as P
 from jax.sharding import Mesh
 from jax.sharding import set_mesh
 
-from model import GPT
+from model import count_params
+from model import precompute_frequencies
+from model import GPT, forward
 from utils import logical_to_sharding
 from fineweb_dataloader import BinaryTokenDataLoader
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 
 logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
-
-
-def count_params(model):
-    """Count the parameters in an Equinox model"""
-    return sum(x.size for x in jax.tree_util.tree_leaves(model))
-
-
-def precompute_frequencies(
-    positions: jax.Array, features: int, theta=10000.0, dtype=None
-):
-    """Generate Sin/Cos for Rotary Embeddings."""
-    fraction = jnp.arange(0, features, 2, dtype=jnp.float32) / features
-    timescale = theta**fraction
-    rotational_frequency = 1.0 / timescale
-    sinusoid_inp = jnp.einsum(
-        "BT,k->BTk",
-        positions,
-        rotational_frequency,
-        precision=jax.lax.Precision.HIGHEST,
-        out_sharding=P(None, None, None),
-    )
-    sin = jnp.sin(sinusoid_inp)
-    cos = jnp.cos(sinusoid_inp)
-    if dtype is not None:
-        sin = sin.astype(dtype)
-        cos = cos.astype(dtype)
-    return sin, cos
-
-
-def calculate_rope(x: jax.Array, sin: jax.Array, cos: jax.Array) -> jax.Array:
-    assert x.ndim == 4 and sin.ndim == 3 and cos.ndim == 3
-    orig_dtype = x.dtype
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    sin, cos = sin[:, :, None, :], cos[:, :, None, :]
-    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(
-        orig_dtype
-    )
-
-
-def embedding_forward(params, x):
-    return params.weight.at[x, :].get()
-
-
-def rmsnorm_forward(x, eps=1e-5):
-    orig_dtype = x.dtype
-    x = x.astype(jnp.float32)
-    scale = jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
-    return (x / scale).astype(orig_dtype)
-
-
-def linear_forward(params, x):
-    out = jnp.einsum("...d, dv-> ...v", x, params.weight)
-    if params.bias is not None:
-        return out + params.bias
-    else:
-        return out
-
-
-def attn_forward(params, x, freqs):
-    orig_dtype = x.dtype
-    bsz, seqlen, _ = x.shape
-    sin, cos = freqs
-
-    with jax.named_scope("qkv_matmul"):
-        q = jnp.einsum("btd, dhq -> bthq", x, params.wq)
-        k = jnp.einsum("btd, dhq -> bthq", x, params.wk)
-        v = jnp.einsum("btd, dhq -> bthq", x, params.wv)
-
-    with jax.named_scope("rope"):
-        q = calculate_rope(q, sin, cos)
-        k = calculate_rope(k, sin, cos)
-
-    with jax.named_scope("qk_norm"):
-        q = rmsnorm_forward(q)
-        k = rmsnorm_forward(k)
-
-    # output shape: (bsz, seqlen, q_heads, head_dim)
-    with jax.named_scope("attention"):
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        attn = jax.nn.dot_product_attention(
-            q, k, v, is_causal=True, implementation="cudnn", scale=scale
-        ).astype(orig_dtype)
-
-    # params.wo is of shape (q_heads, head_dim, d_emb)
-    with jax.named_scope("projection"):
-        out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
-    return out
-
-
-def mlp_forward(params, x):
-    x = linear_forward(params.fc1, x)
-    x = jnp.square(jax.nn.relu(x)).astype(x.dtype)
-    x = linear_forward(params.fc2, x)
-    return x
-
-
-def block_forward(params, x, freqs):
-    # Attention
-    with jax.named_scope("pre_attn_norm"):
-        attn_in = rmsnorm_forward(x)
-    attn_out = attn_forward(params.attn, attn_in, freqs)
-    with jax.named_scope("residual"):
-        x = x + attn_out
-
-    # FFN
-    with jax.named_scope("post_attn_norm"):
-        ffn_in = rmsnorm_forward(x)
-    with jax.named_scope("ffn"):
-        ffn_out = mlp_forward(params.mlp, ffn_in)
-    with jax.named_scope("residual"):
-        x = x + ffn_out
-    return x
-
-
-def forward(params, x, freqs):
-    with jax.named_scope("embedding"):
-        x = embedding_forward(params.embed, x)
-
-    with jax.named_scope("norm"):
-        x = rmsnorm_forward(x)
-
-    for block in params.blocks:
-        x = block_forward(block, x, freqs)
-
-    with jax.named_scope("norm"):
-        x = rmsnorm_forward(x)
-
-    with jax.named_scope("unembed"):
-        logits = linear_forward(params.lm_head, x)
-
-    with jax.named_scope("logit_soft_capping"):
-        logits = 15.0 * jnp.tanh(logits / 15.0)
-    return logits
 
 
 def compute_loss(params, x_batch, y_batch, freqs):
