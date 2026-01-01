@@ -32,7 +32,7 @@ The models here can be trained with both `AdamW` and `Muon` optimizers (via Opta
 - [x] Pretrain a GPT-2-like model on FineWeb 10B tokens
 - [x] Inference
 - [ ] Speculative Decoding
-- [ ] Add tricks from `Modded NanoGPT` repo to pus the convergence
+- [ ] Add tricks from [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo to push the convergence
 - [ ] Leaderboard to track run time for convergence wrt tricks
 - [ ] Supervised fine-tuning on a dataset
 - [ ] Reinforcement learning on a dataset
@@ -43,7 +43,7 @@ The models here can be trained with both `AdamW` and `Muon` optimizers (via Opta
 
 ## Contributing
 
-Contributions are welcome.
+Contributions are welcome. Apart from bug fixes, the task list above is a good start for contributions.
 
 - **Before you start:** Please open an issue to discuss significant changes (new features, refactors, training pipeline changes).
 - **Branching:** Create a feature branch from `main` (e.g., `feat/<name>` or `fix/<name>`).
