@@ -227,6 +227,6 @@ class Config:
     rules: ShardingRules = dataclasses.field(default_factory=ShardingRules)
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     per_device_batch_size: int = 32
-    ckpt_dir: str
-    load_ckpt_path: str
+    ckpt_dir: str = None
+    load_ckpt_path: str = None
     
