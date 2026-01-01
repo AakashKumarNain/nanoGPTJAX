@@ -228,4 +228,5 @@ class Config:
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     per_device_batch_size: int = 32
     ckpt_dir: str
+    load_ckpt_path: str
     
