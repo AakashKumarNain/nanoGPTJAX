@@ -176,24 +176,39 @@ def sample_from_model(
 
 if __name__ == "__main__":
     devices = np.array(jax.devices())
+    print("Found devices: ", devices)
+    print("Platform: ", devices[0].platform)
     mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
     sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
     cfg = Config(mesh=mesh, rules=sharding_rules)
 
     # Get the weight shardings
     model_sharding = GPT.shardings(cfg.mesh, cfg.rules, cfg.model)
+    print("Loading weights from the checkpoint...")
     model = load_weights_from_checkpoint(cfg.load_ckpt_path, model_sharding)
-    print("Model weights loaded from the checkpoint successfully!\n")
+    print("Weights loaded from the checkpoint successfully!")
 
-    tokenizer = tiktoken.get_encoding("gpt2")
-    PAD_ID = tokenizer.eot_token
+    base_tokenizer = tiktoken.get_encoding("gpt2")
+    PAD_TOKEN = "<|pad|>"
+
+    tokenizer = tiktoken.Encoding(
+        name="gpt2_with_pad",
+        pat_str=base_tokenizer._pat_str,
+        mergeable_ranks=base_tokenizer._mergeable_ranks,
+        special_tokens={
+            **base_tokenizer._special_tokens,
+            PAD_TOKEN: base_tokenizer.n_vocab,  # next available token id
+        },
+    )
+
+    PAD_ID = tokenizer.encode(PAD_TOKEN, allowed_special={"<|pad|>"})[0]
     max_new_tokens = 100
-    top_k = 500
+    top_k = None
 
     jax.set_mesh(cfg.mesh)
 
     # Warmup
-    prompts = ["Did you hear the noise coming"] * 4
+    prompts = ["<|endoftext|>Did you hear the noise coming "] * 4
     key = jax.random.PRNGKey(0)
     print("Warming up the model...")
 
@@ -212,10 +227,10 @@ if __name__ == "__main__":
     print("Warming up complete!\nGenerating...")
 
     prompts = [
-        "Did you notice that this world",
-        "Hear that?",
-        "Hello World! My dear",
-        "Some say we are tired far",
+        "<|endoftext|>Did you notice that this world",
+        "<|endoftext|>Hear that?",
+        "<|endoftext|>Hello World! My dear",
+        "<|endoftext|>Some say we are tired far",
     ]
     key, subkey = jax.random.split(key)
     start = time.perf_counter()
@@ -236,6 +251,6 @@ if __name__ == "__main__":
     decoded = tokenizer.decode_batch(out.tolist())
 
     for p, d in zip(prompts, decoded):
-        print(f"Prompt: {p}\n")
+        print(f"Prompt: {p}")
         print(f"Completion: {d}")
         print("-" * 75)
