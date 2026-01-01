@@ -41,6 +41,39 @@ The models here can be trained with both `AdamW` and `Muon` optimizers (via Opta
 
 <br>
 
+## Getting Started
+
+1. Install uv
+```
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv --version
+```
+
+2. Create a `venv`
+```
+uv venv --python 3.12
+source .venv/bin/activate
+```
+
+3. Install dependencies
+```
+uv pip install -e .
+uv sync
+
+# If you are running the code on GPUs, run this instead:
+uv sync --all-extras
+```
+
+4. Run inference by providing the checkpoint path
+```
+# Change this in the config file
+load_ckpt_path = /home/.../params  # absolute path only
+
+# Run the inference code
+python inference.py
+```
+
+
 ## Contributing
 
 Contributions are welcome. Apart from bug fixes, the task list above is a good start for contributions.
