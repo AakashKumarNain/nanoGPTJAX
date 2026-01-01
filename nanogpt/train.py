@@ -12,16 +12,14 @@ os.environ.update(
 )
 
 
+import time
 import warnings
 import logging
 from pathlib import Path
-
-import time
 from functools import partial
-import optax
-import tiktoken
 
 import jax
+import optax
 import numpy as np
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
@@ -82,8 +80,6 @@ cfg = Config(mesh=mesh, rules=sharding_rules)
 
 # Load the model
 model = GPT.init(jax.random.PRNGKey(0), cfg.model)
-# Tokenizer
-tokenizer = tiktoken.get_encoding("gpt2")
 
 
 per_device_bsz = cfg.per_device_batch_size
