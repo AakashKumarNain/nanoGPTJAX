@@ -16,6 +16,14 @@ from utils import jax_pytree_struct
 from layers import Embedding, Linear, GroupedQueryAttention
 
 
+if jax.default_backend() == "gpu":
+    ATTN_IMPL = "cudnn"
+elif jax.default_backend() == "tpu":
+    ATTN_IMPL = "xla"
+else:
+    ATTN_IMPL = None
+
+
 @jax_pytree_struct
 class MLP(ParamInitializer):
     fc1: Linear
@@ -161,7 +169,7 @@ def attn_forward(params, x, freqs):
     with jax.named_scope("attention"):
         scale = 1.0 / math.sqrt(q.shape[-1])
         attn = jax.nn.dot_product_attention(
-            q, k, v, is_causal=True, implementation="cudnn", scale=scale
+            q, k, v, is_causal=True, implementation=ATTN_IMPL, scale=scale
         ).astype(orig_dtype)
 
     # params.wo is of shape (q_heads, head_dim, d_emb)
@@ -287,7 +295,7 @@ def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
             k_attn,
             v_attn,
             mask=mask,
-            implementation="cudnn",
+            implementation=ATTN_IMPL,
             scale=scale,
         ).astype(orig_dtype)
 
