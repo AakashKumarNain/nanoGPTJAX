@@ -67,7 +67,7 @@ uv sync --all-extras
 ```
 # Change the hparams in the file if you want.
 # TODO: Streamline all params via config
-python train.py
+python nanogpt/train.py
 ```
 
 5. Run inference by providing the checkpoint path
@@ -76,7 +76,7 @@ python train.py
 load_ckpt_path = /home/.../params  # absolute path only
 
 # Run the inference code
-python inference.py
+python nanogpt/inference.py
 ```
 
 
