@@ -57,7 +57,6 @@ source .venv/bin/activate
 
 3. Install dependencies
 ```
-uv pip install -e .
 uv sync
 
 # If you are running the code on GPUs, run this instead:
