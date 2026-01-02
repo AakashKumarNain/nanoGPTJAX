@@ -74,12 +74,15 @@ def val_step(params, x_batch, y_batch, freqs):
 
 # Get the mesh, sharding rules, amd the config
 devices = np.array(jax.devices())
+print("Number of devices found:", len(devices))
 mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
 sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
 cfg = Config(mesh=mesh, rules=sharding_rules)
 
 # Load the model
-model = GPT.init(jax.random.PRNGKey(0), cfg.model)
+print("Building GPT model based on the config...")
+model = GPT.init(jax.random.PRNGKey(0), cfg)
+print("Model built successfully!")
 
 
 per_device_bsz = cfg.per_device_batch_size
@@ -89,6 +92,8 @@ seqlen = cfg.model.seqlen
 head_dim = cfg.model.attn.head_dim
 data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
 
+# TODO: Make these hparams either part of config or allow them to
+# be passed at runtime
 max_lr = 6e-4
 min_lr = 0.0
 warmup_steps = 30
@@ -139,7 +144,7 @@ mngr = ocp.CheckpointManager(
 
 # Data loader
 train_ds = BinaryTokenDataLoader(
-    file_patterns=["fineweb10B/*train*.bin"],
+    file_patterns=[cfg.data_dir + "*train*.bin"],
     seq_len=seqlen,
     batch_size=bsz,
     bos_token=50256,
@@ -187,7 +192,8 @@ patience_counter = 0
 best_step = 0
 last_checkpoint_step = 0
 
-print("Training...\n")
+print("Starting training (the first step will take some time for compilation...)\n")
+# TODO: Add validation loop after improving the dataloader
 
 for step in range(last_checkpoint_step, total_train_steps):
     start = time.time()
@@ -208,7 +214,6 @@ for step in range(last_checkpoint_step, total_train_steps):
             train_step_loss += loss
 
     avg_train_loss = train_step_loss / grad_accum_steps
-    avg_val_loss = 0.0
 
     # Block for accurate timing
     jax.block_until_ready(avg_train_loss)
