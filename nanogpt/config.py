@@ -229,4 +229,5 @@ class Config:
     per_device_batch_size: int = 32
     ckpt_dir: str = None
     load_ckpt_path: str = None
+    data_dir: str = None
     
