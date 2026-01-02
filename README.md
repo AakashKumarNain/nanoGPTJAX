@@ -64,7 +64,14 @@ uv sync
 uv sync --all-extras
 ```
 
-4. Run inference by providing the checkpoint path
+4. Train the model
+```
+# Change the hparams in the file if you want.
+# TODO: Streamline all params via config
+python train.py
+```
+
+5. Run inference by providing the checkpoint path
 ```
 # Change this in the config file
 load_ckpt_path = /home/.../params  # absolute path only
@@ -82,6 +89,8 @@ Contributions are welcome. Apart from bug fixes, the task list above is a good s
 - **Branching:** Create a feature branch from `main` (e.g., `feat/<name>` or `fix/<name>`).
 - **Testing:** If you add or change functionality, include minimal tests or a small reproducible script to validate the change.
 - **Pull requests:** In your PR description, include (1) what changed, (2) why it changed, and (3) how to reproduce/verify. <br>
+
+We use `ruff` for linting and formatting. Please run `ruff check nanogpt/*.py` and `ruff format nanogpt/*.py` before sending a PR. We will streamline this process via `pre-commit` soon.  
 
 ## References
 
