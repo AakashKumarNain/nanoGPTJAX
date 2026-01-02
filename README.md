@@ -100,5 +100,5 @@ This work would not have been possible without these existing resources:
 - [nanoGPT](https://github.com/karpathy/nanoGPT)
 - [nanochat](https://github.com/karpathy/nanochat)
 - [JAX LLM Examples](https://github.com/jax-ml/jax-llm-examples/tree/main)
-- [JAX](https://github.com/jax-ml/jax)
+- [JAX Scaling Book](https://jax-ml.github.io/scaling-book/)
 - [JAX Tutorials](https://www.kaggle.com/code/aakashnain/tf-jax-tutorials-part-4-jax-and-devicearray)
