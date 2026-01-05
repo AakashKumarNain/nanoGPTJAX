@@ -1,31 +1,35 @@
 # 1. Is this another abstraction (hell)?
 
-It’s well known that the JAX ecosystem is pretty fragmented. There are different libraries and frameworks out there, each of which suits a wide variety of use cases. I’ve been involved in the development of some of these abstractions (Keras 3) and have contributed to others (Equinox, Orbax, etc.). Though Google has recently leaned more toward Flax, I’m not a big fan of that API (totally personal opinion; I wouldn’t have designed the API that way). Keras and Equinox are good abstractions, and you should totally try them out.
+It is a well known fact that the JAX ecosystem is fragmented. There are different libraries and frameworks (based on JAX), each serving its own purpose. I’ve been involved in the development of some of these (Keras 3) and have contributed to others (Equinox, Orbax, etc.). Though Google has recently leaned more toward Flax, I’m not a big fan of the API (totally personal opinion; I wouldn’t have designed the API that way).
 
-Having said that, when working with JAX, I prefer to keep things minimal in terms of abstraction but with maximum control over the functionality. This abstraction here is as thin as it can be, yet it’s highly scalable, efficient, and doesn’t get in your way. <br><br>
+> [!NOTE]
+> [Keras](https://keras.io/) and [Equinox](https://docs.kidger.site/equinox/) are good abstractions, and you should totally try them out.
+
+Having said that, when working with JAX, I prefer keeping things minimal (in terms of abstraction) but having maximum control over the functionality. This abstraction provided in the current codebase is lightweight, yet highly scalable, efficient, easy to read.
 
 
 # 2. Who is the target audience?
 
 If you are someone who:
-- loves minimal (low‑level) abstractions
+- enjoys minimal (low‑level) abstractions
 - loves to write scalable code that can run on thousands of accelerators
 - wants to write JAX for more than fun
 - loves training LLMs and VLMs at scale
 
-then you’ve arrived at the right place. We will write every piece of the modern LLM stack with this abstraction from scratch. <br><br>
+then you are at the right place. We will write every piece of the modern LLM stack with this abstraction from scratch.
 
 # 3. The Mental Model
 
 Though there are many valid design choices for building an abstraction, I do not like the idea of mixing OOP‑based design choices with purely functional paradigms. Broadly speaking, there is only a finite set of things we need to achieve while designing the abstraction. These include:
 
-- We want to keep the “state” (e.g., model parameters) and the functionality using that state separate. For example, we can use a class as a namespace for the parameters belonging to a layer, and then define a function that consumes that state, stays pure, and plays nicely with JAX transformations.
+- We want to keep the “state” (model parameters, optimizer parameters, etc.) and the functionality separate. For example, we can use a class as a namespace for the parameters belonging to a layer, and then define a function that consumes that state, stays pure, and plays nicely with JAX transformations.
 - We should be able to change the functionality as needed without changing how we store the state.
 - It needs to be scalable and agnostic of the accelerator used.
 
-This design cleanly separates “what to create” (parameter specifications), “where to put it” (sharding), and “how to create it” (initialization). That separation is the core abstraction that lets you write simple layer definitions and then scale them across devices without changing layer code.
+> [!IMPORTANT]
+> This design cleanly separates “what to create” (parameter specifications), “where to put it” (sharding), and “how to create it” (initialization). That separation is the core abstraction that lets you write simple layer definitions and then scale them across devices without changing layer code.
 
-We only need two classes to achieve all of this, defined in the `utils.py` file.
+We only need two classes to achieve all of this, defined in the [`utils.py`](https://github.com/AakashKumarNain/nanoGPTJAX/blob/main/nanogpt/utils.py) file.
 
 - **ParamSpec:** Defines the specification of JAX arrays we want to create. It stores the following abstract information about our arrays:
     - *shape*: shape of the array
@@ -79,7 +83,7 @@ We only need two classes to achieve all of this, defined in the `utils.py` file.
         return jtu.tree_unflatten(spec_treedef, initialized_leaves)
     ```
 
-<br>That is all the abstraction we need to build everything from scratch. :) <br><br>
+That is all the abstraction we need to build everything from scratch. 😄
 
 
 # 4. An Example
