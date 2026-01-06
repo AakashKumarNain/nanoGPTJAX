@@ -63,14 +63,33 @@ uv sync
 uv sync --all-extras
 ```
 
-4. Train the model
+# 4. Prepare the dataset
+```
+# Download the dataset
+python download_fineweb_tokens.py
+
+# Preprocess the dataset
+bos_id = 50256  # BOS token id
+
+train_files = sorted(glob.glob("fineweb10B/*train*.bin"))
+val_files = sorted(glob.glob("fineweb10B/*val*.bin"))
+
+train_idx_path = cfg.train_idx_path # "fineweb_train_bos_index.npz"
+val_idx_path = cfg.val_idx_path # "fineweb_val_bos_index.npz"
+
+build_bos_doc_index(train_files, bos_id, train_idx_path)
+build_bos_doc_index(val_files, bos_id, val_idx_path)
+```
+
+5. Train the model
 ```
 # Change the hparams in the file if you want.
 # TODO: Streamline all params via config
+
 python nanogpt/train.py
 ```
 
-5. Run inference by providing the checkpoint path
+6. Run inference by providing the checkpoint path
 ```
 # Change this in the config file
 load_ckpt_path = /home/.../params  # absolute path only
