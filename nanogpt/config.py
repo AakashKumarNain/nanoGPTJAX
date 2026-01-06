@@ -20,9 +20,11 @@ ATTN_HEADS_AXIS_NAME = "y"
 TENSOR_AXIS_NAME = ("y", "z")
 
 
-def kernel_init(num_layers):
-    std = 0.02 * (2 * num_layers) ** -0.5
-    return jax.nn.initializers.normal(stddev=std)
+def init_uniform(scale=1.0):
+    def kernel_init(key, shape, dtype):
+        return jax.random.uniform(key, shape, dtype, minval=-scale, maxval=scale)
+
+    return kernel_init
 
 
 @dataclasses.dataclass
@@ -35,7 +37,7 @@ class EmbeddingConfig:
     weight_logical_axes: Tuple[str, str] = ("embed_in", "embed_out")
 
     def __post_init__(self):
-        self.weight_initializer = kernel_init(self.num_layers)
+        self.weight_initializer = jax.nn.initializers.normal(stddev=1.0)
 
 
 @dataclasses.dataclass
@@ -57,19 +59,18 @@ class MultiHeadAttentionConfig:
     wo_logical_axes: Tuple[str, str] = ("attn_wo_in", "attn_wo_out")
 
     def __post_init__(self):
-        init = kernel_init(self.num_layers)
-        self.wq_initializer = init
-        self.wk_initializer = init
-        self.wv_initializer = init
-        self.wo_initializer = init
+        self.wq_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
+        self.wk_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
+        self.wv_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
+        self.wo_initializer = jax.nn.initializers.zeros
 
 
 @dataclasses.dataclass
 class GroupedQueryAttentionConfig:
     dtype: jnp.dtype = jnp.bfloat16
     d_emb: int = 768
-    q_heads: int = 8
-    kv_heads: int = 4
+    q_heads: int = 6
+    kv_heads: int = 6
     num_layers: int = 12
     head_dim: int = dataclasses.field(init=False)
 
@@ -78,18 +79,33 @@ class GroupedQueryAttentionConfig:
     wv_initializer: Callable = dataclasses.field(init=False)
     wo_initializer: Callable = dataclasses.field(init=False)
 
-    wq_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_q_heads", "attn_head_dim")
-    wk_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_kv_heads", "attn_head_dim")
-    wv_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_kv_heads", "attn_head_dim")
-    wo_logical_axes: Tuple[str, str, str] = ("attn_wo_in", "attn_head_dim", "attn_wo_out")
+    wq_logical_axes: Tuple[str, str, str] = (
+        "attn_wqkv_in",
+        "attn_q_heads",
+        "attn_head_dim",
+    )
+    wk_logical_axes: Tuple[str, str, str] = (
+        "attn_wqkv_in",
+        "attn_kv_heads",
+        "attn_head_dim",
+    )
+    wv_logical_axes: Tuple[str, str, str] = (
+        "attn_wqkv_in",
+        "attn_kv_heads",
+        "attn_head_dim",
+    )
+    wo_logical_axes: Tuple[str, str, str] = (
+        "attn_wo_in",
+        "attn_head_dim",
+        "attn_wo_out",
+    )
 
     def __post_init__(self):
         self.head_dim = self.d_emb // self.q_heads
-        init = kernel_init(self.num_layers)
-        self.wq_initializer = init
-        self.wk_initializer = init
-        self.wv_initializer = init
-        self.wo_initializer = init
+        self.wq_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
+        self.wk_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
+        self.wv_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
+        self.wo_initializer = jax.nn.initializers.zeros
 
 
 @dataclasses.dataclass
@@ -99,12 +115,8 @@ class LinearConfig:
     out_features: int = 50304
     use_bias: bool = False
     num_layers: int = 12
-
-    weight_initializer: Callable = dataclasses.field(init=False)
+    weight_initializer: Callable = None
     weight_logical_axes: Tuple[str, str] = ("linear_in", "linear_out")
-
-    def __post_init__(self):
-        self.weight_initializer = kernel_init(self.num_layers)
 
 
 @dataclasses.dataclass
@@ -122,6 +134,7 @@ class MLPConfig:
             in_features=self.d_emb,
             out_features=self.d_emb * 4,
             num_layers=self.num_layers,
+            weight_initializer=init_uniform(scale=3**0.5 * self.d_emb**-0.5),
             weight_logical_axes=("mlp_fc1_in", "mlp_fc1_out"),
         )
         self.fc2 = LinearConfig(
@@ -129,12 +142,14 @@ class MLPConfig:
             in_features=self.d_emb * 4,
             out_features=self.d_emb,
             num_layers=self.num_layers,
+            weight_initializer=jax.nn.initializers.zeros,
             weight_logical_axes=("mlp_fc2_in", "mlp_fc2_out"),
         )
 
+
 @dataclasses.dataclass
 class ModelConfig:
-    seqlen: int = 1024
+    seqlen: int = 2048
     vocab_size: int = 50304
     d_emb: int = 768
     num_layers: int = 12
@@ -153,7 +168,9 @@ class ModelConfig:
     elif attn_type == "gqa":
         attn: GroupedQueryAttentionConfig = dataclasses.field(init=False)
     else:
-        raise ValueError(f"Only these attention types are supported for now `['gqa', 'mha']`. Received = {attn_type}")
+        raise ValueError(
+            f"Only these attention types are supported for now `['gqa', 'mha']`. Received = {attn_type}"
+        )
 
     def __post_init__(self):
         self.embed = EmbeddingConfig(
@@ -187,7 +204,7 @@ class ModelConfig:
             in_features=self.d_emb,
             out_features=self.vocab_size,
             num_layers=self.num_layers,
-            weight_logical_axes=("linear_in", "linear_out"),
+            weight_initializer=jax.nn.initializers.normal(stddev=0.001),
         )
 
 
@@ -219,7 +236,7 @@ class ShardingRules:
 
     linear_in: AxisName = None
     linear_out: AxisName = None
-    
+
 
 @jax_pytree_struct
 class Config:
@@ -227,7 +244,15 @@ class Config:
     rules: ShardingRules = dataclasses.field(default_factory=ShardingRules)
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     per_device_batch_size: int = 32
+
+    # Path to the directory where checkpoint needs to be stored
     ckpt_dir: str = None
+    # Path to the specific checkpoint to be loaded for inference
     load_ckpt_path: str = None
+
+    # Path to the cached fineweb10B tokens files
     data_dir: str = None
-    
+
+    # Path to the npz file built using preprocessing in dataloader
+    train_idx_path: str = None
+    val_idx_path: str = None
