@@ -157,13 +157,13 @@ def attn_forward(params, x, freqs):
         k = jnp.einsum("btd, dhq -> bthq", x, params.wk)
         v = jnp.einsum("btd, dhq -> bthq", x, params.wv)
 
-    with jax.named_scope("rope"):
-        q = calculate_rope(q, sin, cos)
-        k = calculate_rope(k, sin, cos)
-
     with jax.named_scope("qk_norm"):
         q = rmsnorm_forward(q)
         k = rmsnorm_forward(k)
+
+    with jax.named_scope("rope"):
+        q = calculate_rope(q, sin, cos)
+        k = calculate_rope(k, sin, cos)
 
     # output shape: (bsz, seqlen, q_heads, head_dim)
     with jax.named_scope("attention"):
@@ -200,9 +200,6 @@ def forward(params, x, freqs):
     with jax.named_scope("embedding"):
         x = embedding_forward(params.embed, x)
 
-    with jax.named_scope("norm"):
-        x = rmsnorm_forward(x)
-
     for block in params.blocks:
         x = block_forward(block, x, freqs)
 
@@ -213,7 +210,7 @@ def forward(params, x, freqs):
         logits = linear_forward(params.lm_head, x)
 
     with jax.named_scope("logit_soft_capping"):
-        logits = 15.0 * jnp.tanh(logits / 15.0)
+        logits = 15.0 * jnp.tanh(logits.astype(jnp.float32) / 15.0)
     return logits
 
 
@@ -242,15 +239,15 @@ def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
         k = jnp.einsum("btd, dhq -> bthq", x, params.wk)
         v = jnp.einsum("btd, dhq -> bthq", x, params.wv)
 
-    # 2. RoPE: (B, T, H, D)
-    with jax.named_scope("rope"):
-        q = calculate_rope(q, sin, cos)
-        k = calculate_rope(k, sin, cos)
-
-    # 3. Norm: (B, T, H, D)
+    # 2. Norm: (B, T, H, D)
     with jax.named_scope("qk_norm"):
         q = rmsnorm_forward(q)
         k = rmsnorm_forward(k)
+
+    # 3. RoPE: (B, T, H, D)
+    with jax.named_scope("rope"):
+        q = calculate_rope(q, sin, cos)
+        k = calculate_rope(k, sin, cos)
 
     # 4. Cache Update (store only real tokens)
     token_mask = q_segment_ids[:, None, :, None].astype(k.dtype)
@@ -340,8 +337,8 @@ def forward_v2(params, x, segment_ids, cache, head_dim):
 
     freqs = precompute_frequencies(positions, features=head_dim, dtype=x.dtype)
 
-    with jax.named_scope("norm"):
-        x = rmsnorm_forward(x)
+    # with jax.named_scope("norm"):
+    #     x = rmsnorm_forward(x)
 
     new_k, new_v = [], []
     next_iter_value = cache.iter
@@ -363,7 +360,7 @@ def forward_v2(params, x, segment_ids, cache, head_dim):
         logits = linear_forward(params.lm_head, x)
 
     with jax.named_scope("logit_soft_capping"):
-        logits = 15.0 * jnp.tanh(logits / 15.0)
+        logits = 15.0 * jnp.tanh(logits.astype(jnp.float32) / 15.0)
 
     updated_cache = dataclasses.replace(
         cache,
