@@ -30,7 +30,7 @@ from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward
 from utils import logical_to_sharding
-from fineweb_dataloader import BinaryTokenDataLoader
+from fineweb_dataloader import make_grain_iter
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 
 logging.getLogger("absl").setLevel(logging.ERROR)
@@ -142,18 +142,29 @@ mngr = ocp.CheckpointManager(
 )
 
 
-# Data loader
-train_ds = BinaryTokenDataLoader(
-    file_patterns=[cfg.data_dir + "*train*.bin"],
-    seq_len=seqlen,
+print("Building data loader...")
+train_source, train_ds = make_grain_iter(
+    index_path=cfg.train_idx_path,
+    seqlen=seqlen,
     batch_size=bsz,
-    bos_token=50256,
-    align_to_bos=True,
-    seed=123456,
-    use_bos_index=True,
-    num_workers=64,
-    prefetch_batches=32,
+    shuffle=True,
+    seed=1,
+    num_threads=32,
+    prefetch_buffer_size=512,
+    drop_remainder=True,
 )
+
+val_source, val_ds = make_grain_iter(
+    index_path=cfg.val_idx_path,
+    seqlen=seqlen,
+    batch_size=bsz,
+    shuffle=False,
+    seed=1,
+    num_threads=16,
+    prefetch_buffer_size=512,
+    drop_remainder=True,
+)
+print("Data loader bult successfull!")
 
 
 print("")
@@ -199,9 +210,13 @@ for step in range(last_checkpoint_step, total_train_steps):
     start = time.time()
     train_step_loss = 0.0
     for micro_step in range(grad_accum_steps):
-        x, y = train_ds.get_batch()
-        x = jax.device_put(x, data_sharding)
-        y = jax.device_put(y, data_sharding)
+        try:
+            x, y = next(train_ds)
+            x = jax.device_put(x, data_sharding)
+            y = jax.device_put(y, data_sharding)
+        except StopIteration:
+            print("Data exhausted....")
+            break
         if micro_step < grad_accum_steps - 1:
             model, loss, optim_state = train_step_accum(
                 model, x, y, freqs, optim_state, optim
