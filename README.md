@@ -77,7 +77,7 @@ python fineweb_dataloader.py --fineweb10b_path=../fineweb10B --save_train_idx_pa
 
 5. Train the model
 ```
-# Pass the data dir, and indices path we created above in the config file. 
+# Pass the data dir, and indices path we created above in the config file located at `nanochat/config.py`
 # Change the hparams in the file if you want.
 # TODO: Streamline all params via config
 
