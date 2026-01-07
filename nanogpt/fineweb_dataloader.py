@@ -1,28 +1,10 @@
-# This file is generated using codex. This is a bit buggy/feature-incomplete
-# and we aim to replace this with out own implementation n the future.
-
-# We do a bit of prepreocessing here - find a the start and end of the sequences
-# based on where the BOS token is. Once we have those boundaries, we save it
-# on the disk so that we can some time during data loading in the training loop.
-# Once we have downloaded the cached fineweb10B tokens, do the preprocessing as following:
-# 
-# files = sorted(glob.glob("fineweb10B/*train*.bin"))
-# bos_id = 50256
-# out_path = "fineweb_train_bos_index.npz"
-# build_bos_doc_index(files, bos_id, out_path)
-
-# # Build index for validation tokens
-# files = sorted(glob.glob("fineweb10B/*val*.bin"))
-# bos_id = 50256
-# out_path = "fineweb_val_bos_index.npz"
-# build_bos_doc_index(files, bos_id, out_path)
-#
-
 import os
+import grain
+import argparse
 import threading
 import numpy as np
-import grain
 import numpy as np
+from pathlib import Path
 
 
 HEADER_INTS = 256
@@ -95,7 +77,7 @@ def build_bos_doc_index(files, bos_id, out_path):
 
 
 def memmap_tokens(path, n_tok):
-    return np.memmap("../"+ path, dtype=np.uint16, mode="r", offset=HEADER_BYTES, shape=(n_tok,))
+    return np.memmap(path, dtype=np.uint16, mode="r", offset=HEADER_BYTES, shape=(n_tok,))
 
 
 
@@ -172,3 +154,42 @@ def make_grain_iter(index_path, seqlen, batch_size, shuffle=True, seed=0,
     ds = ds.to_iter_dataset(grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=prefetch_buffer_size))
     ds = iter(ds)
     return source, ds
+
+
+def preprocess_data(
+        train_files, 
+        save_train_idx_path,
+        val_files=None,
+        save_val_idx_path=None,
+        bos_id=50256,
+    ):
+    print("Building index for training data...", end=" ")
+    build_bos_doc_index(files=train_files, bos_id=bos_id, out_path=save_train_idx_path)
+    print("Complete!")
+
+    if val_files is not None:
+        print("Building index for validation data...", end=" ")
+        build_bos_doc_index(files=val_files, bos_id=bos_id, out_path=save_val_idx_path)
+        print("Complete!")
+
+
+if __name__ == "__main__":
+    args = argparse.ArgumentParser()
+    args.add_argument("--fineweb10b_path", help="Path to the directory containing fineweb10B token files", type=str)
+    args.add_argument("--save_train_idx_path", help="Path to the save the index built using training files e.g. train.npz", type=str)
+    args.add_argument("--save_val_idx_path", help="Path to the save the index built using validation files e.g. val.npz", type=str)
+    args.add_argument("--bos_id", help="ID to use as BOS token. Defulats to 50256", type=int, default=50256)
+
+    args = args.parse_args()
+    train_files = sorted(map(str, list(Path(args.fineweb10b_path).glob("*train*.bin"))))
+    print("Number of training files found: ", len(train_files))
+    val_files = sorted(map(str, list(Path(args.fineweb10b_path).glob("*val*.bin"))))
+    print("Number of validation files found: ", len(val_files))
+
+    preprocess_data(
+        train_files=train_files,
+        save_train_idx_path=args.save_train_idx_path,
+        val_files=val_files or None,
+        save_val_idx_path=args.save_val_idx_path or None,
+        bos_id=args.bos_id
+    )
