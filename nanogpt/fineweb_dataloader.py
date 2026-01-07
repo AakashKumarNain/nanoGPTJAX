@@ -60,8 +60,8 @@ def build_bos_doc_index(files, bos_id, out_path):
         doc_ends.append(ends)
 
     shard_ids = np.concatenate(shard_ids) if shard_ids else np.zeros((0,), np.int32)
-    starts    = np.concatenate(starts)    if starts    else np.zeros((0,), np.int64)
-    doc_ends  = np.concatenate(doc_ends)  if doc_ends  else np.zeros((0,), np.int64)
+    starts = np.concatenate(starts) if starts else np.zeros((0,), np.int64)
+    doc_ends = np.concatenate(doc_ends) if doc_ends else np.zeros((0,), np.int64)
 
     # os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     np.savez(
@@ -77,8 +77,9 @@ def build_bos_doc_index(files, bos_id, out_path):
 
 
 def memmap_tokens(path, n_tok):
-    return np.memmap(path, dtype=np.uint16, mode="r", offset=HEADER_BYTES, shape=(n_tok,))
-
+    return np.memmap(
+        path, dtype=np.uint16, mode="r", offset=HEADER_BYTES, shape=(n_tok,)
+    )
 
 
 class BosDocIndexedSource(grain.sources.RandomAccessDataSource):
@@ -139,30 +140,43 @@ class BosDocIndexedSource(grain.sources.RandomAccessDataSource):
         return x, y
 
 
-def make_grain_iter(index_path, seqlen, batch_size, shuffle=True, seed=0,
-                    num_threads=16, prefetch_buffer_size=512, drop_remainder=True):
-    
+def make_grain_iter(
+    index_path,
+    seqlen,
+    batch_size,
+    shuffle=True,
+    seed=0,
+    num_threads=16,
+    prefetch_buffer_size=512,
+    drop_remainder=True,
+):
     if not os.path.exists(index_path):
-        raise FileNotFoundError(f"Index: {index_path} was not found. Did you build the index before running this?")
-    
+        raise FileNotFoundError(
+            f"Index: {index_path} was not found. Did you build the index before running this?"
+        )
+
     source = BosDocIndexedSource(index_path, seqlen=seqlen)
     ds = grain.MapDataset.source(source)
     if shuffle:
         ds = ds.shuffle(seed=seed)
 
     ds = ds.batch(batch_size=batch_size, drop_remainder=drop_remainder).repeat()
-    ds = ds.to_iter_dataset(grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=prefetch_buffer_size))
+    ds = ds.to_iter_dataset(
+        grain.ReadOptions(
+            num_threads=num_threads, prefetch_buffer_size=prefetch_buffer_size
+        )
+    )
     ds = iter(ds)
     return source, ds
 
 
 def preprocess_data(
-        train_files, 
-        save_train_idx_path,
-        val_files=None,
-        save_val_idx_path=None,
-        bos_id=50256,
-    ):
+    train_files,
+    save_train_idx_path,
+    val_files=None,
+    save_val_idx_path=None,
+    bos_id=50256,
+):
     print("Building index for training data...", end=" ")
     build_bos_doc_index(files=train_files, bos_id=bos_id, out_path=save_train_idx_path)
     print("Complete!")
@@ -175,10 +189,27 @@ def preprocess_data(
 
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
-    args.add_argument("--fineweb10b_path", help="Path to the directory containing fineweb10B token files", type=str)
-    args.add_argument("--save_train_idx_path", help="Path to the save the index built using training files e.g. train.npz", type=str)
-    args.add_argument("--save_val_idx_path", help="Path to the save the index built using validation files e.g. val.npz", type=str)
-    args.add_argument("--bos_id", help="ID to use as BOS token. Defulats to 50256", type=int, default=50256)
+    args.add_argument(
+        "--fineweb10b_path",
+        help="Path to the directory containing fineweb10B token files",
+        type=str,
+    )
+    args.add_argument(
+        "--save_train_idx_path",
+        help="Path to the save the index built using training files e.g. train.npz",
+        type=str,
+    )
+    args.add_argument(
+        "--save_val_idx_path",
+        help="Path to the save the index built using validation files e.g. val.npz",
+        type=str,
+    )
+    args.add_argument(
+        "--bos_id",
+        help="ID to use as BOS token. Defulats to 50256",
+        type=int,
+        default=50256,
+    )
 
     args = args.parse_args()
     train_files = sorted(map(str, list(Path(args.fineweb10b_path).glob("*train*.bin"))))
@@ -191,5 +222,5 @@ if __name__ == "__main__":
         save_train_idx_path=args.save_train_idx_path,
         val_files=val_files or None,
         save_val_idx_path=args.save_val_idx_path or None,
-        bos_id=args.bos_id
+        bos_id=args.bos_id,
     )
