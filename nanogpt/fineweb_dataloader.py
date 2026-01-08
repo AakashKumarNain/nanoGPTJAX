@@ -31,6 +31,7 @@ def read_header(path):
 
 def build_bos_doc_index(files, bos_id, out_path):
     bos_id = int(bos_id)
+    file_names = [x.name for x in files]
 
     tokens_per_shard = []
     total_tokens = 0
@@ -66,7 +67,7 @@ def build_bos_doc_index(files, bos_id, out_path):
     # os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     np.savez(
         out_path,
-        files=np.asarray(files),
+        file_names=np.asarray(file_names),
         bos_id=np.int64(bos_id),
         total_tokens=np.int64(total_tokens),
         tokens_per_shard=np.asarray(tokens_per_shard, dtype=np.int64),
@@ -83,9 +84,10 @@ def memmap_tokens(path, n_tok):
 
 
 class BosDocIndexedSource(grain.sources.RandomAccessDataSource):
-    def __init__(self, index_path, *, seqlen):
+    def __init__(self, data_dir, index_path, seqlen):
         z = np.load(index_path, allow_pickle=False)
-        self.files = [str(x) for x in z["files"]]
+        data_dir = Path(data_dir)
+        self.files = [data_dir / str(x) for x in z["file_names"]]
         self.bos_id = int(z["bos_id"])
         self.total_tokens = int(z["total_tokens"])
         self.tokens_per_shard = z["tokens_per_shard"].astype(np.int64)
@@ -141,6 +143,7 @@ class BosDocIndexedSource(grain.sources.RandomAccessDataSource):
 
 
 def make_grain_iter(
+    data_dir,
     index_path,
     seqlen,
     batch_size,
@@ -155,7 +158,9 @@ def make_grain_iter(
             f"Index: {index_path} was not found. Did you build the index before running this?"
         )
 
-    source = BosDocIndexedSource(index_path, seqlen=seqlen)
+    source = BosDocIndexedSource(
+        data_dir=data_dir, index_path=index_path, seqlen=seqlen
+    )
     ds = grain.MapDataset.source(source)
     if shuffle:
         ds = ds.shuffle(seed=seed)
@@ -212,9 +217,9 @@ if __name__ == "__main__":
     )
 
     args = args.parse_args()
-    train_files = sorted(map(str, list(Path(args.fineweb10b_path).glob("*train*.bin"))))
+    train_files = sorted(Path(args.fineweb10b_path).glob("*train*.bin"))
     print("Number of training files found: ", len(train_files))
-    val_files = sorted(map(str, list(Path(args.fineweb10b_path).glob("*val*.bin"))))
+    val_files = sorted(Path(args.fineweb10b_path).glob("*val*.bin"))
     print("Number of validation files found: ", len(val_files))
 
     preprocess_data(
