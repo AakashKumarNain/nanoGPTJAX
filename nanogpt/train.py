@@ -144,6 +144,7 @@ mngr = ocp.CheckpointManager(
 
 print("Building data loader...")
 train_source, train_ds = make_grain_iter(
+    data_dir=cfg.data_dir,
     index_path=cfg.train_idx_path,
     seqlen=seqlen,
     batch_size=bsz,
@@ -151,10 +152,11 @@ train_source, train_ds = make_grain_iter(
     seed=1,
     num_threads=32,
     prefetch_buffer_size=512,
-    drop_remainder=True,
-)
+    drop_remainder=True
+) 
 
 val_source, val_ds = make_grain_iter(
+    data_dir=cfg.data_dir,
     index_path=cfg.val_idx_path,
     seqlen=seqlen,
     batch_size=bsz,
@@ -162,7 +164,7 @@ val_source, val_ds = make_grain_iter(
     seed=1,
     num_threads=16,
     prefetch_buffer_size=512,
-    drop_remainder=True,
+    drop_remainder=True
 )
 print("Data loader bult successfull!")
 
