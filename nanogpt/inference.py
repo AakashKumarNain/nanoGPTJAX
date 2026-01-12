@@ -1,4 +1,5 @@
 import time
+import dataclasses
 from functools import partial
 
 import jax
@@ -8,7 +9,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 
 from model import GPT, forward_v2
-from kvcache import KVCache
+from kvcache import KVCache, count_left_padding
 from checkpoint_utils import load_weights_from_checkpoint
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 
@@ -21,15 +22,15 @@ def gather_last_logits(logits, seq_lengths):
 
 
 @partial(jax.jit, static_argnames=("pad_id", "head_dim"))
-def prefill_step(params, tokens, cache, pad_id, head_dim):
-    """Run a prefill pass and return next-token logits plus updated cache."""
-    if tokens.ndim == 1:
-        tokens = tokens[None, :]
-    segment_ids = (tokens != pad_id).astype(jnp.int32)
-    logits, cache = forward_v2(params, tokens, segment_ids, cache, head_dim)
-    seq_lengths = jnp.sum(segment_ids != 0, axis=-1).astype(jnp.int32)
-    next_logits = gather_last_logits(logits, seq_lengths)
-    return next_logits, cache
+def prefill(params, input_ids, segment_ids, cache, head_dim, pad_id):
+    """Prefill the KV cache with the prompt."""
+    left_pad_counts = count_left_padding(input_ids, pad_id=pad_id)
+    iter = -jnp.ones_like(cache.iter)
+    cache = dataclasses.replace(cache, starts=left_pad_counts, iter=iter)
+    logits, cache = forward_v2(params, input_ids, segment_ids, cache, head_dim)
+    last_token_logits = logits[:, -1, :]
+    next_tokens = jnp.argmax(last_token_logits, axis=-1)
+    return logits, next_tokens[:, None], cache
 
 
 def decode_step(params, tokens, cache, head_dim):
@@ -143,7 +144,7 @@ def sample_from_model(
     cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
 
     # Prefill
-    logits, cache = prefill_step(params, tokens, cache, pad_id, head_dim)
+    logits, cache = prefill(params, tokens, cache, pad_id, head_dim)
 
     decode_key, sub = jax.random.split(decode_key)
     next_tokens = jax.jit(sample_from_logits, static_argnames=("temperature", "top_k"))(
