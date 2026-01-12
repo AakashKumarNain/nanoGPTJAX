@@ -23,8 +23,8 @@ from utils import jax_pytree_struct, layer_repr
 class KVCache(ParamInitializer):
     k: list[jax.Array]  # (batch_size, kv_heads, max_seq_len, head_dim)
     v: list[jax.Array]  # (batch_size, kv_heads, max_seq_len, head_dim)
-    iter: jax.Array     # [] sequences are right-aligned for slice update performance
-    starts: jax.Array   # [batch_size]  sequences are right-aligned, we need start indices
+    iter: jax.Array     # [] sequences are right-aligned for slice update performance    # fmt: off
+    starts: jax.Array   # [batch_size]  sequences are right-aligned, we need start indices. # fmt: off
     time_axis: int = dataclasses.field(metadata=dict(static=True), default=2)
     size: int = dataclasses.field(metadata=dict(static=True), default=-1)
 
@@ -104,13 +104,15 @@ def make_attention_mask(
 
 @partial(jax.jit, static_argnums=(1, 2))
 def prepare_chunk(tokens, pad_to: int, pad_id: int):
-    """Right-pad token sequences to pad_to and emit binary mask (1=token)."""
+    """Left-pad token sequences to pad_to and emit binary mask (1=token)."""
     if tokens.ndim == 1:
         tokens = tokens[None, :]
     padding_width = pad_to - tokens.shape[-1]
-    padded = jnp.pad(tokens, [(0, 0), (0, padding_width)], constant_values=pad_id)
-    segment_ids = (padded != pad_id).astype(jnp.int32)
-    return padded, segment_ids
+    tokens = jnp.pad(
+        tokens, [(0, 0), (padding_width, 0)], mode="constant", constant_values=pad_id
+    )
+    segment_ids = jnp.where(tokens != pad_id, 1, 0).astype(jnp.int32)
+    return tokens, segment_ids
 
 
 @partial(auto_axes, out_sharding=P(None))
