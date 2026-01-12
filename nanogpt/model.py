@@ -1,4 +1,3 @@
-import math
 import dataclasses
 
 import jax
@@ -9,6 +8,7 @@ from kvcache import update_slice
 from kvcache import count_left_padding
 from kvcache import make_attention_mask
 from kvcache import segment_ids_to_positions
+from kvcache import length_minus_right_padding
 
 from utils import layer_repr
 from utils import ParamInitializer
@@ -133,7 +133,7 @@ def linear_forward(params, x):
 
 def mlp_forward(params, x):
     x = linear_forward(params.fc1, x)
-    x = jnp.square(jax.nn.relu(x).astype(x.dtype))
+    x = jnp.square(jax.nn.relu(x))
     x = linear_forward(params.fc2, x)
     return x
 
@@ -167,7 +167,7 @@ def attn_forward(params, x, freqs):
 
     # output shape: (bsz, seqlen, q_heads, head_dim)
     with jax.named_scope("attention"):
-        scale = 1.0 / math.sqrt(q.shape[-1])
+        scale = None  # 1.0 / math.sqrt(q.shape[-1])
         attn = jax.nn.dot_product_attention(
             q, k, v, is_causal=True, implementation=ATTN_IMPL, scale=scale
         ).astype(orig_dtype)
@@ -182,7 +182,9 @@ def block_forward(params, x, freqs):
     # Attention
     with jax.named_scope("pre_attn_norm"):
         attn_in = rmsnorm_forward(x)
+
     attn_out = attn_forward(params.attn, attn_in, freqs)
+
     with jax.named_scope("residual"):
         x = x + attn_out
 
@@ -210,7 +212,8 @@ def forward(params, x, freqs):
         logits = linear_forward(params.lm_head, x)
 
     with jax.named_scope("logit_soft_capping"):
-        logits = 15.0 * jnp.tanh(logits.astype(jnp.float32) / 15.0)
+        logits = logits.astype(jnp.float32)
+        logits = 15.0 * jnp.tanh(logits / 15.0)
     return logits
 
 
@@ -218,20 +221,9 @@ def forward(params, x, freqs):
 
 
 def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
+    """Attention forward pass with KV cache support."""
     orig_dtype = x.dtype
-    bsz, seqlen, _ = x.shape
     sin, cos = freqs
-    size = cache.size
-
-    # Number of real tokens we are writing this step (per batch element and globally)
-    q_segment_ids = (segment_ids != 0).astype(jnp.int32)
-    seq_lengths = jnp.sum(q_segment_ids, axis=-1).astype(jnp.int32)
-    max_seq_len = jnp.max(seq_lengths)
-    prev_fill = cache.fill_len()
-    start_pos = jnp.where(cache.iter < 0, 0, cache.iter % size)
-    next_iter = jnp.where(cache.iter < 0, max_seq_len, cache.iter + max_seq_len)
-    new_fill = jnp.minimum(prev_fill + seq_lengths, size)
-    kv_starts = (next_iter - new_fill) % size
 
     # 1. QKV Projection: (B, T, D) -> (B, T, H, D)
     with jax.named_scope("qkv_matmul"):
@@ -249,64 +241,76 @@ def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
         q = calculate_rope(q, sin, cos)
         k = calculate_rope(k, sin, cos)
 
-    # 4. Cache Update (store only real tokens)
-    token_mask = q_segment_ids[:, None, :, None].astype(k.dtype)
-    k_store = jnp.transpose(k, (0, 2, 1, 3)) * token_mask
-    v_store = jnp.transpose(v, (0, 2, 1, 3)) * token_mask
-
+    # 4. Cache updates
     with jax.named_scope("cache_update"):
-        k_upd = update_slice(
-            cache.k[idx], k_store, start_pos, update_axis=cache.time_axis
+        # Transpose to cache format: (B, T, H, D) -> (B, H, T, D)
+        kt = jnp.transpose(k, (0, 2, 1, 3))
+        vt = jnp.transpose(v, (0, 2, 1, 3))
+
+        # Write position in cache
+        it = jnp.maximum(cache.iter, 0)
+        k_updated = update_slice(cache.k[idx], kt, it, update_axis=cache.time_axis)
+        v_updated = update_slice(cache.v[idx], vt, it, update_axis=cache.time_axis)
+        cache_updates = (k_updated, v_updated)
+
+        # Compute mask parameters (matching reference implementation)
+        additional_tokens = jnp.max(length_minus_right_padding(segment_ids))
+
+        # time_indices: logical position relative to each sequence's start
+        # This handles the circular buffer correctly
+        time_indices = (
+            jnp.arange(0, k_updated.shape[cache.time_axis])[None, :]
+            - cache.starts[:, None]
+        ) % cache.size
+
+        # Segment IDs for masking
+        q_segment_ids = jnp.where(segment_ids != 0, 1, 0)
+        # Valid KV positions: logical time indices in [0, fill_len + additional_tokens)
+        kv_segment_ids = (time_indices >= 0) & (
+            time_indices < cache.fill_len()[:, None] + additional_tokens
         )
-        v_upd = update_slice(
-            cache.v[idx], v_store, start_pos, update_axis=cache.time_axis
-        )
-        left_pad_count = count_left_padding(q_segment_ids, pad_id=0).reshape(-1)
-        q_offset = prev_fill - left_pad_count
-        kv_offset = -kv_starts
-        buffer_indices = jnp.arange(size, dtype=jnp.int32)[None, :]
-        kv_segment_ids = (
-            (buffer_indices - kv_starts[:, None]) % size < new_fill[:, None]
-        ).astype(jnp.int32)
+
+        # Offsets for causal mask computation
+        q_offset = cache.fill_len() - count_left_padding(q_segment_ids, pad_id=0)
+        kv_offset = -cache.starts
 
     # 5. Attention
     with jax.named_scope("attention"):
-        q_attn = q
-        k_attn = jnp.transpose(k_upd, (0, 2, 1, 3))
-        v_attn = jnp.transpose(v_upd, (0, 2, 1, 3))
+        qlen = q.shape[1]
+        kvlen = k_updated.shape[2]
+        scale = None
 
         mask = make_attention_mask(
-            q_len=seqlen,
-            k_len=size,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
-            q_offset=q_offset,
-            kv_offset=kv_offset,
+            qlen,
+            kvlen,
+            q_segment_ids,
+            kv_segment_ids.astype(jnp.int32),
+            q_offset,
+            kv_offset,
             causal=True,
         )
 
-        scale = 1.0 / math.sqrt(q.shape[-1])
-
         attn = jax.nn.dot_product_attention(
-            q_attn,
-            k_attn,
-            v_attn,
+            q,  # (B, T, H, D)
+            jnp.transpose(k_updated, (0, 2, 1, 3)),  # (B, S, H, D)
+            jnp.transpose(v_updated, (0, 2, 1, 3)),  # (B, S, H, D)
             mask=mask,
             implementation=ATTN_IMPL,
             scale=scale,
         ).astype(orig_dtype)
 
-    # 6. Projection
+    # 6. Output projection
     with jax.named_scope("projection"):
         out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
 
-    cache_updates = (k_upd, v_upd, next_iter, kv_starts)
     return out, cache_updates
 
 
 def block_forward_v2(params, x, segment_ids, freqs, cache, idx):
+    """Transformer block forward pass with KV cache."""
     with jax.named_scope("pre_attn_norm"):
         attn_in = rmsnorm_forward(x)
+
     attn_out, cache_updates = attn_forward_v2(
         params.attn, attn_in, segment_ids, freqs, cache, idx
     )
@@ -326,32 +330,21 @@ def block_forward_v2(params, x, segment_ids, freqs, cache, idx):
 
 
 def forward_v2(params, x, segment_ids, cache, head_dim):
+    """Full model forward pass with KV cache."""
     with jax.named_scope("embedding"):
         x = embedding_forward(params.embed, x)
 
+    # Compute positions
     positions = segment_ids_to_positions(segment_ids)
+    positions = positions + cache.fill_len()[:, None]
 
-    # Adjust positions based on cache (e.g. for decoding steps)
-    if cache is not None:
-        positions = positions + cache.fill_len()[:, None]
+    # Always compute the frequencies in fp32
+    freqs = precompute_frequencies(positions, features=head_dim)
 
-    freqs = precompute_frequencies(positions, features=head_dim, dtype=x.dtype)
-
-    # with jax.named_scope("norm"):
-    #     x = rmsnorm_forward(x)
-
-    new_k, new_v = [], []
-    next_iter_value = cache.iter
-    next_starts = cache.starts
-
+    all_cache_updates = []
     for idx, block in enumerate(params.blocks):
-        x, (k_upd, v_upd, iter_candidate, starts_candidate) = block_forward_v2(
-            block, x, segment_ids, freqs, cache, idx
-        )
-        new_k.append(k_upd)
-        new_v.append(v_upd)
-        next_iter_value = iter_candidate
-        next_starts = starts_candidate
+        x, cache_updates = block_forward_v2(block, x, segment_ids, freqs, cache, idx)
+        all_cache_updates.append(cache_updates)
 
     with jax.named_scope("norm"):
         x = rmsnorm_forward(x)
@@ -360,14 +353,19 @@ def forward_v2(params, x, segment_ids, cache, head_dim):
         logits = linear_forward(params.lm_head, x)
 
     with jax.named_scope("logit_soft_capping"):
-        logits = 15.0 * jnp.tanh(logits.astype(jnp.float32) / 15.0)
+        logits = logits.astype(jnp.float32)
+        logits = 15.0 * jnp.tanh(logits / 15.0)
 
-    updated_cache = dataclasses.replace(
+    # Update cache
+    new_k = [z[0] for z in all_cache_updates]
+    new_v = [z[1] for z in all_cache_updates]
+    additional_tokens = segment_ids.shape[-1]
+
+    cache = dataclasses.replace(
         cache,
         k=new_k,
         v=new_v,
-        iter=next_iter_value,
-        starts=next_starts,
+        iter=(jnp.maximum(0, cache.iter) + additional_tokens) % cache.size,
     )
 
-    return logits, updated_cache
+    return logits, cache
