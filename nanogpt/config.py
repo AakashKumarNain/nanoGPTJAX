@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import dataclasses
+from pathlib import Path
 from typing import Callable, Tuple, Optional
 from jax.sharding import Mesh
 from utils import jax_pytree_struct
@@ -59,9 +60,10 @@ class MultiHeadAttentionConfig:
     wo_logical_axes: Tuple[str, str] = ("attn_wo_in", "attn_wo_out")
 
     def __post_init__(self):
-        self.wq_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
-        self.wk_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
-        self.wv_initializer = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
+        init = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
+        self.wq_initializer = init
+        self.wk_initializer = init
+        self.wv_initializer = init
         self.wo_initializer = jax.nn.initializers.zeros
 
 
@@ -69,8 +71,8 @@ class MultiHeadAttentionConfig:
 class GroupedQueryAttentionConfig:
     dtype: jnp.dtype = jnp.bfloat16
     d_emb: int = 768
-    q_heads: int = 6
-    kv_heads: int = 6
+    q_heads: int = 8
+    kv_heads: int = 4
     num_layers: int = 12
     head_dim: int = dataclasses.field(init=False)
 
@@ -153,8 +155,8 @@ class ModelConfig:
     vocab_size: int = 50304
     d_emb: int = 768
     num_layers: int = 12
-    q_heads: int = 6
-    kv_heads: int = 6
+    q_heads: int = 8
+    kv_heads: int = 4
     attn_type: str = "gqa"
     num_heads: Optional[Tuple[int, None]] = dataclasses.field(init=False)
     dtype: jnp.dtype = jnp.bfloat16
@@ -173,6 +175,11 @@ class ModelConfig:
         )
 
     def __post_init__(self):
+        if self.q_heads == self.kv_heads and self.attn_type == "gqa":
+            raise Warning(
+                "When the number of query heads equals the number of kv heads, JAX computes MHA not GQA!"
+            )
+
         self.embed = EmbeddingConfig(
             dtype=self.dtype,
             vocab_size=self.vocab_size,
@@ -238,12 +245,48 @@ class ShardingRules:
     linear_out: AxisName = None
 
 
+@dataclasses.dataclass
+class CheckpointConfig:
+    # Checkpoint related
+    max_checkpoints_to_keep: int = 3
+    checkpoint_save_steps: int = 50
+    last_checkpoint_step: int = 0
+    # Directory where checkpoints will be saved
+    save_ckpt_dir: Path | str = ""
+    # Path to params subdirectory within a checkpoint from which weights will be loaded
+    load_params_ckpt_path: Path | str = ""
+
+
+@dataclasses.dataclass
+class HyperParams:
+    # Batch size related
+    per_device_batch_size: int = 32
+    desired_batch_size: int = 524288
+    grad_accum_steps: Optional[float] = dataclasses.field(init=False)
+
+    # Optimizer related
+    max_lr: float = 6e-4
+    min_lr: float = 0.0
+    warmup_steps: int = 50
+    b1: float = 0.9
+    b2: float = 0.95
+    weight_decay: float = 0.0
+    grad_clip_norm: float = 1.0
+    total_train_steps: int = 5000
+
+    # Other
+    es_patience: int = 500
+    val_interval: int = 50
+
+
 @jax_pytree_struct
 class Config:
+    seed: jax.Array = None
     mesh: Mesh = None
     rules: ShardingRules = dataclasses.field(default_factory=ShardingRules)
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    per_device_batch_size: int = 32
+    hparams: HyperParams = dataclasses.field(default_factory=HyperParams)
+    ckpt_cfg: CheckpointConfig = dataclasses.field(default_factory=CheckpointConfig)
 
     # Path to the directory where checkpoint needs to be stored
     ckpt_dir: str = None
