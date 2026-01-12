@@ -38,7 +38,8 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointMan
 
 
 def compute_loss(params, x_batch, y_batch, freqs):
-    logits = forward(params, x_batch, freqs).astype(jnp.float32)
+    # Ensure the logits are in fp32
+    logits = forward(params, x_batch, freqs)
     loss = jnp.mean(
         optax.losses.softmax_cross_entropy_with_integer_labels(
             logits=logits, labels=y_batch
@@ -85,27 +86,24 @@ model = GPT.init(jax.random.PRNGKey(0), cfg)
 print("Model built successfully!")
 
 
-per_device_bsz = cfg.per_device_batch_size
-# Total batch size we can fit on one device x num_devices. We are doing DDP here
+per_device_bsz = cfg.hparams.per_device_batch_size
 bsz = per_device_bsz * len(devices)
 seqlen = cfg.model.seqlen
 head_dim = cfg.model.attn.head_dim
 data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
 
-# TODO: Make these hparams either part of config or allow them to
-# be passed at runtime
-max_lr = 6e-4
-min_lr = 0.0
-warmup_steps = 30
-desired_batch_size = 524288
+max_lr = cfg.hparams.max_lr
+min_lr = 0.01 * max_lr
+warmup_steps = cfg.hparams.warmup_steps
+desired_batch_size = cfg.hparams.desired_batch_size
 grad_accum_steps = max(4, desired_batch_size // (bsz * seqlen))
-b1 = 0.9
-b2 = 0.95
-weight_decay = 0.1
-grad_clip_norm = 1.0
-total_train_steps = 800
-max_checkpoints_to_keep = 3
-checkpoint_save_steps = 20
+b1 = cfg.hparams.b1
+b2 = cfg.hparams.b2
+weight_decay = cfg.hparams.weight_decay
+grad_clip_norm = cfg.hparams.grad_clip_norm
+total_train_steps = cfg.hparams.total_train_steps
+max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
+checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
 
 
 # LR schedule
@@ -119,14 +117,16 @@ schedule = optax.warmup_cosine_decay_schedule(
 # Optimizer
 base_optim = optax.chain(
     optax.clip_by_global_norm(grad_clip_norm),
-    optax.adamw(schedule, b1=b1, b2=b2, weight_decay=weight_decay),
+    optax.adamw(
+        schedule, b1=b1, b2=b2, weight_decay=weight_decay, mu_dtype=jnp.float32
+    ),
     # optax.contrib.muon(schedule, adam_b1=b1, adam_b2=b2, adam_weight_decay=weight_decay, weight_decay=weight_decay)
 )
 optim = optax.MultiSteps(base_optim, every_k_schedule=grad_accum_steps)
 optim_state = optim.init(model)
 
 # Checkpointing
-ckpt_path = Path(cfg.ckpt_dir)
+ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir)
 options = ocp.CheckpointManagerOptions(
     max_to_keep=max_checkpoints_to_keep, save_interval_steps=checkpoint_save_steps
 )
@@ -152,8 +152,8 @@ train_source, train_ds = make_grain_iter(
     seed=1,
     num_threads=32,
     prefetch_buffer_size=512,
-    drop_remainder=True
-) 
+    drop_remainder=True,
+)
 
 val_source, val_ds = make_grain_iter(
     data_dir=cfg.data_dir,
@@ -164,7 +164,7 @@ val_source, val_ds = make_grain_iter(
     seed=1,
     num_threads=16,
     prefetch_buffer_size=512,
-    drop_remainder=True
+    drop_remainder=True,
 )
 print("Data loader bult successfull!")
 
@@ -194,13 +194,11 @@ print("-" * 75)
 # Compute the frequencies
 positions = jnp.arange(seqlen)[None, :]
 with set_mesh(cfg.mesh):
-    freqs = precompute_frequencies(
-        positions=positions, features=head_dim, dtype=cfg.model.dtype
-    )
+    freqs = precompute_frequencies(positions=positions, features=head_dim)
 
 
 best_loss = float("inf")
-patience = 30
+patience = cfg.hparams.es_patience
 patience_counter = 0
 best_step = 0
 last_checkpoint_step = 0
