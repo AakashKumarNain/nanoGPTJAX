@@ -3,7 +3,6 @@ import grain
 import argparse
 import threading
 import numpy as np
-import numpy as np
 from pathlib import Path
 
 
@@ -217,9 +216,9 @@ if __name__ == "__main__":
     )
 
     args = args.parse_args()
-    train_files = sorted(Path(args.fineweb10b_path).glob("*train*.bin"))
+    train_files = list(Path(args.fineweb10b_path).glob("*train*.bin"))
     print("Number of training files found: ", len(train_files))
-    val_files = sorted(Path(args.fineweb10b_path).glob("*val*.bin"))
+    val_files = list(Path(args.fineweb10b_path).glob("*val*.bin"))
     print("Number of validation files found: ", len(val_files))
 
     preprocess_data(
