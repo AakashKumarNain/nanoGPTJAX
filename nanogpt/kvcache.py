@@ -23,8 +23,10 @@ from utils import jax_pytree_struct, layer_repr
 class KVCache(ParamInitializer):
     k: list[jax.Array]  # (batch_size, kv_heads, max_seq_len, head_dim)
     v: list[jax.Array]  # (batch_size, kv_heads, max_seq_len, head_dim)
-    iter: jax.Array     # [] sequences are right-aligned for slice update performance    # fmt: off
-    starts: jax.Array   # [batch_size]  sequences are right-aligned, we need start indices. # fmt: off
+    # fmt: off
+    iter: jax.Array     # [] sequences are right-aligned for slice update performance
+    starts: jax.Array   # [batch_size]  sequences are right-aligned, we need start indices.
+     # fmt: off
     time_axis: int = dataclasses.field(metadata=dict(static=True), default=2)
     size: int = dataclasses.field(metadata=dict(static=True), default=-1)
 
