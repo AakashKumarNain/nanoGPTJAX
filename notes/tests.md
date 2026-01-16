@@ -132,3 +132,6 @@ for _ in range(10):
 # print(tokenizer.decode([921, 447, 247, 260, 407, 3436, 13, 198, 464, 717, 640]))
 
 ```
+
+We got rid of the above bug by explicitly copying the `k` and `v` values into new arrays. Without creating an extra copy, it is not possible
+to make the array contiguous as transpose is just a view in the end. It works now. 
