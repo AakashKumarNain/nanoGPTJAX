@@ -1,4 +1,5 @@
 import time
+import math
 import dataclasses
 from functools import partial
 
@@ -9,41 +10,41 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 
 from model import GPT, forward_v2
-from kvcache import KVCache, count_left_padding
+from kvcache import KVCache, count_left_padding, prepare_chunk
 from checkpoint_utils import load_weights_from_checkpoint
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 
 
-def gather_last_logits(logits, seq_lengths):
-    """Select logits at the final valid position for each sequence."""
-    seq_len = logits.shape[1]
-    indices = jnp.clip(seq_lengths - 1, 0, seq_len - 1)
-    return jax.vmap(lambda logit, idx: logit[idx])(logits, indices)
-
-
-@partial(jax.jit, static_argnames=("pad_id", "head_dim"))
+@partial(jax.jit, static_argnames=("head_dim", "pad_id"))
 def prefill(params, input_ids, segment_ids, cache, head_dim, pad_id):
-    """Prefill the KV cache with the prompt."""
+    """Prefill with LEFT-padded sequences.
+
+    With left padding, starts[b] = count of left pad tokens for sequence b.
+    After prefill, cache.iter = seq_len % cache.size (same for all sequences due to alignment).
+    """
+
     left_pad_counts = count_left_padding(input_ids, pad_id=pad_id)
-    iter = -jnp.ones_like(cache.iter)
-    cache = dataclasses.replace(cache, starts=left_pad_counts, iter=iter)
+    uninitialized_iter = -jnp.ones_like(cache.iter)
+    cache = dataclasses.replace(cache, starts=left_pad_counts, iter=uninitialized_iter)
     logits, cache = forward_v2(params, input_ids, segment_ids, cache, head_dim)
+    # With left padding, last valid token is always at position -1 (rightmost)
     last_token_logits = logits[:, -1, :]
     next_tokens = jnp.argmax(last_token_logits, axis=-1)
-    return logits, next_tokens[:, None], cache
+    return logits, next_tokens, cache
 
 
-def decode_step(params, tokens, cache, head_dim):
-    """Run a single-token decode step and return logits plus updated cache."""
-    if tokens.ndim == 1:
-        tokens = tokens[None, :]
-    segment_ids = jnp.ones_like(tokens, dtype=jnp.int32)
-    logits, cache = forward_v2(params, tokens, segment_ids, cache, head_dim)
+def decode(params, input_ids, cache, head_dim):
+    """Decode step for LEFT-padded sequences.
+
+    All sequences generate at the same position since they're aligned at the right.
+    """
+
+    segment_ids = jnp.ones_like(input_ids, dtype=jnp.int32)
+    logits, cache = forward_v2(params, input_ids, segment_ids, cache, head_dim)
     return logits[:, -1, :], cache
 
 
 def sample_from_logits(logits, rng, temperature=1.0, top_k=0):
-    logits = logits.astype(jnp.float32)
     vocab = logits.shape[-1]
 
     # Greedy path: temperature <= 0
@@ -66,59 +67,51 @@ def sample_from_logits(logits, rng, temperature=1.0, top_k=0):
     return jax.random.categorical(rng, logits, axis=-1).astype(jnp.int32)
 
 
-@partial(
-    jax.jit, static_argnames=("temperature", "head_dim", "max_new_tokens", "top_k")
-)
-def decode(
+@partial(jax.jit, static_argnames=("temperature", "head_dim", "max_new_tokens", "top_k"))  # fmt: off
+def generate(
     params,
     cache,
-    head_dim,
     last_token,
+    generated_tokens,
+    head_dim,
     decode_key,
-    generated,
     temperature,
     top_k,
     max_new_tokens,
 ):
     def decode_body(carry, t):
-        cache, last_token, decode_key, generated = carry
-        logits, cache = decode_step(params, last_token, cache, head_dim)
+        cache, last_token, decode_key, generated_tokens = carry
+        logits, cache = decode(params, last_token, cache, head_dim)
         decode_key, sub = jax.random.split(decode_key)
-        token = sample_from_logits(logits.astype(jnp.float32), sub, temperature, top_k)
-        generated = generated.at[:, t].set(token)
-        return (cache, token[:, None], decode_key, generated), None
+        token = sample_from_logits(logits, sub, temperature, top_k)
+        generated_tokens = generated_tokens.at[:, t].set(token)
+        return (cache, token[:, None], decode_key, generated_tokens), None
 
-    (cache, last_token, decode_key, generated), _ = jax.lax.scan(
+    (cache, last_token, decode_key, generated_tokens), _ = jax.lax.scan(
         decode_body,
-        (cache, last_token, decode_key, generated),
+        (cache, last_token, decode_key, generated_tokens),
         jnp.arange(1, max_new_tokens),
     )
-    return generated
+    return generated_tokens
 
 
-def pad_prompts(prompts, tokenizer, pad_id, round_to_power_of_two=True):
-    if isinstance(prompts, str):
-        prompts = [prompts]
-    encoded = tokenizer.encode_batch(prompts, allowed_special={"<|endoftext|>"})
-    if not encoded:
-        raise ValueError("No prompts provided.")
-    max_len = max(len(seq) for seq in encoded)
-    if max_len == 0:
-        max_len = 1
-    if round_to_power_of_two:
-        pad_len = 1 << (max_len - 1).bit_length()
+def pad_tokens(tokens, pad_id, pad_to_power_of_two=False):
+    curr_max_len = max([len(s) for s in tokens])
+    if pad_to_power_of_two:
+        pad_to = 2 ** math.ceil(math.log2((curr_max_len)))
     else:
-        pad_len = max_len
-    batch, seq_lengths = [], []
-    for seq in encoded:
-        if not seq:
-            seq = [pad_id]
-        seq_lengths.append(len(seq))
-        pad_width = pad_len - len(seq)
-        batch.append(seq + [pad_id] * pad_width)
-    tokens = jnp.array(batch, dtype=jnp.int32)
-    seq_lengths = jnp.array(seq_lengths, dtype=jnp.int32)
-    return tokens, seq_lengths
+        pad_to = curr_max_len
+    padded = []
+    segment_ids = []
+
+    for encoded in tokens:
+        p, s = prepare_chunk(jnp.array(encoded), pad_id=pad_id, pad_to=pad_to)
+        padded.append(p[0])
+        segment_ids.append(s[0])
+
+    padded = jnp.stack(padded)
+    segment_ids = jnp.stack(segment_ids)
+    return padded, segment_ids
 
 
 def sample_from_model(
@@ -131,45 +124,43 @@ def sample_from_model(
     head_dim,
     temperature=1.0,
     top_k=500,
+    pad_to_power_of_two=True,
 ):
     # TODO: Move it out of this functions and shard the tokens
-    tokens, _ = pad_prompts(
-        prompts, tokenizer, pad_id=pad_id, round_to_power_of_two=True
+    encoded = tokenizer.encode_batch(
+        prompts, allowed_special={"<|endoftext|>", "<|pad|>"}
     )
-    batch_size = tokens.shape[0]
+    input_ids, segment_ids = pad_tokens(
+        encoded, pad_to_power_of_two=pad_to_power_of_two
+    )
 
     cache_key, decode_key = jax.random.split(key)
 
-    # Cache init
+    batch_size = input_ids.shape[0]
     cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
-
-    # Prefill
-    logits, cache = prefill(params, tokens, cache, pad_id, head_dim)
-
-    decode_key, sub = jax.random.split(decode_key)
-    next_tokens = jax.jit(sample_from_logits, static_argnames=("temperature", "top_k"))(
-        logits.astype(jnp.float32), sub, temperature, top_k
+    logits, next_tokens, cache = prefill(
+        model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
     )
-
-    generated = (
+    generated_tokens = (
         jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
         .at[:, 0]
         .set(next_tokens)
     )
-    last_token = next_tokens[:, None]
 
     # Decode loop via jitted scan
     if max_new_tokens > 1:
-        generated = decode(
-            params,
+        last_token = next_tokens[:, None]
+        top_k = 0 if top_k is None else int(top_k)
+        generated = generate(
+            model,
             cache,
-            head_dim,
             last_token,
+            generated_tokens,
+            head_dim,
             decode_key,
-            generated,
-            temperature,
-            top_k,
-            max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            max_new_tokens=max_new_tokens,
         )
 
     return generated
