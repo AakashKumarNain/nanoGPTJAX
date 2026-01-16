@@ -240,17 +240,18 @@ def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
     with jax.named_scope("rope"):
         q = calculate_rope(q, sin, cos)
         k = calculate_rope(k, sin, cos)
-    
+
     # 4. Cache updates. Cache shape: (B, H, T, D)
     with jax.named_scope("cache_update"):
         kt = jnp.transpose(k, (0, 2, 1, 3))
         vt = jnp.transpose(v, (0, 2, 1, 3))
         it = jnp.maximum(cache.iter, 0)
-    
+
         k_updated = update_slice(cache.k[idx], kt, it, update_axis=cache.time_axis)
         v_updated = update_slice(cache.v[idx], vt, it, update_axis=cache.time_axis)
         cache_updates = (k_updated, v_updated)
 
+        # fmt: off
         # Compute masks using original logic
         additional_tokens = jnp.max(length_minus_right_padding(segment_ids))
         time_indices = (jnp.arange(0, v_updated.shape[-2])[None, :] - cache.starts[:, None]) % cache.size
@@ -264,6 +265,7 @@ def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
         # to ensure that arrays are contagious is to make an **explicit** copy.
         kt = jnp.copy(jnp.transpose(k_updated, (0, 2, 1, 3)))
         vt = jnp.copy(jnp.transpose(v_updated, (0, 2, 1, 3)))
+        # fmt: on
 
     # 5. Attention
     with jax.named_scope("attention"):
@@ -271,10 +273,7 @@ def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
         kvlen = k_updated.shape[2]
         scale = 1.0 / math.sqrt(q.shape[-1])
         mask = make_attention_mask(
-            qlen, kvlen,
-            q_segment_ids, kv_segment_ids,
-            q_offset, kv_offset,
-            causal=True
+            qlen, kvlen, q_segment_ids, kv_segment_ids, q_offset, kv_offset, causal=True
         )
 
         # fmt: off
@@ -287,7 +286,7 @@ def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
             scale=scale
         ).astype(orig_dtype)
         # fmt: on
-        
+
     # 6. Projection
     with jax.named_scope("projection"):
         out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
