@@ -15,6 +15,25 @@ from checkpoint_utils import load_weights_from_checkpoint
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 
 
+def pad_tokens(tokens, pad_id, pad_to_power_of_two=False):
+    curr_max_len = max([len(s) for s in tokens])
+    if pad_to_power_of_two:
+        pad_to = 2 ** math.ceil(math.log2((curr_max_len)))
+    else:
+        pad_to = curr_max_len
+    padded = []
+    segment_ids = []
+
+    for encoded in tokens:
+        p, s = prepare_chunk(jnp.array(encoded), pad_id=pad_id, pad_to=pad_to)
+        padded.append(p[0])
+        segment_ids.append(s[0])
+
+    padded = jnp.stack(padded)
+    segment_ids = jnp.stack(segment_ids)
+    return padded, segment_ids
+
+
 @partial(jax.jit, static_argnames=("head_dim", "pad_id"))
 def prefill(params, input_ids, segment_ids, cache, head_dim, pad_id):
     """Prefill with LEFT-padded sequences.
@@ -27,7 +46,6 @@ def prefill(params, input_ids, segment_ids, cache, head_dim, pad_id):
     uninitialized_iter = -jnp.ones_like(cache.iter)
     cache = dataclasses.replace(cache, starts=left_pad_counts, iter=uninitialized_iter)
     logits, cache = forward_v2(params, input_ids, segment_ids, cache, head_dim)
-    # With left padding, last valid token is always at position -1 (rightmost)
     last_token_logits = logits[:, -1, :]
     next_tokens = jnp.argmax(last_token_logits, axis=-1)
     return logits, next_tokens, cache
@@ -45,25 +63,29 @@ def decode(params, input_ids, cache, head_dim):
 
 
 def sample_from_logits(logits, rng, temperature=1.0, top_k=0):
+    # Ideal order for most use cases is: temperature scaling -> top_k -> top_p
     vocab = logits.shape[-1]
 
     # Greedy path: temperature <= 0
     if temperature <= 0.0:
         return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    else:
+        # Temperature scaling
+        tiny = jnp.finfo(jnp.float32).tiny
+        logits = logits / jnp.maximum(temperature, tiny)
 
-    # Top-k filtering (order vs temperature is immaterial for top-k)
     if top_k is not None:
         k = int(top_k)
         if 0 < k < vocab:
-            sorted_logits = jnp.sort(logits, axis=-1)
-            threshold = sorted_logits[:, -k][:, None]  # kth largest logit
-            logits = jnp.where(logits < threshold, -jnp.inf, logits)
 
-    # Temperature scaling
-    tiny = jnp.finfo(jnp.float32).tiny
-    logits = logits / jnp.maximum(temperature, tiny)
+            def set_values(arr, idx, val):
+                return arr.at[idx].set(val)
 
-    # Sample
+            values, indices = jax.lax.top_k(logits, k)
+            filtered_logits = jnp.full_like(logits, fill_value=-jnp.inf)
+            logits = jax.vmap(set_values, in_axes=(0, 0, 0))(
+                filtered_logits, indices, values
+            )
     return jax.random.categorical(rng, logits, axis=-1).astype(jnp.int32)
 
 
@@ -95,25 +117,6 @@ def generate(
     return generated_tokens
 
 
-def pad_tokens(tokens, pad_id, pad_to_power_of_two=False):
-    curr_max_len = max([len(s) for s in tokens])
-    if pad_to_power_of_two:
-        pad_to = 2 ** math.ceil(math.log2((curr_max_len)))
-    else:
-        pad_to = curr_max_len
-    padded = []
-    segment_ids = []
-
-    for encoded in tokens:
-        p, s = prepare_chunk(jnp.array(encoded), pad_id=pad_id, pad_to=pad_to)
-        padded.append(p[0])
-        segment_ids.append(s[0])
-
-    padded = jnp.stack(padded)
-    segment_ids = jnp.stack(segment_ids)
-    return padded, segment_ids
-
-
 def sample_from_model(
     key,
     prompts,
@@ -139,7 +142,7 @@ def sample_from_model(
     batch_size = input_ids.shape[0]
     cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
     logits, next_tokens, cache = prefill(
-        model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
+        model, input_ids, segment_ids, cache, head_dim, pad_id=pad_id
     )
     generated_tokens = (
         jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
@@ -152,7 +155,7 @@ def sample_from_model(
         last_token = next_tokens[:, None]
         top_k = 0 if top_k is None else int(top_k)
         generated = generate(
-            model,
+            params,
             cache,
             last_token,
             generated_tokens,
@@ -200,8 +203,8 @@ if __name__ == "__main__":
     jax.set_mesh(cfg.mesh)
 
     # Warmup
-    prompts = ["<|endoftext|>Did you hear the noise coming "] * 4
-    key = jax.random.PRNGKey(0)
+    prompts = ["<|endoftext|>Did you hear the noise coming "] * len(devices)
+    key = jax.random.PRNGKey(123)
     print("Warming up the model...")
 
     for _ in range(3):
