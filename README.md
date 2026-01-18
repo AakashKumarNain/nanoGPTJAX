@@ -63,24 +63,16 @@ uv sync
 uv sync --all-extras
 ```
 
-# 4. Prepare the dataset
+4. Prepare the dataset
 ```
 # Download the dataset
 python download_fineweb_tokens.py
-
-# Preprocess the dataset
-
-# Assuming fineweb10B is the directory containing the downloaded dataset, preprocess
-# the dataset and build the token indices as follows:
-python fineweb_dataloader.py --fineweb10b_path=../fineweb10B --save_train_idx_path=./train.npz --save_val_idx_path="./val.npz"
 ```
 
 5. Train the model
 ```
-# Pass the data dir, and indices path we created above in the config file located at `nanochat/config.py`
+# Pass the data dir path in the config file located at `nanochat/config.py`
 # Change the hparams in the file if you want.
-# TODO: Streamline all params via config
-
 python nanogpt/train.py
 ```
 
@@ -93,6 +85,14 @@ load_ckpt_path = /home/.../params  # absolute path only
 python nanogpt/inference.py
 ```
 
+
+## Benchmarking 
+
+As of now without using any tricks, the training loss converges in around ~16 minutes on `4 X H100` machine. The dataloader is not optimal,
+we have not included gradient accumulation, we have not used any tricks to improve the convergence. Still, 16 minutes is neither bad nor great.
+I am sure we can do it in under 5-8 minutes soon without using many tricks. 🤞
+
+We will soon add a table that will list down the runs with changes in code and performance improvements.
 
 ## Contributing
 
