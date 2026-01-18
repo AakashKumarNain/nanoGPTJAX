@@ -65,6 +65,8 @@ def load_weights_from_checkpoint(path, sharding):
     Returns:
         PyTree with weights loaded from the given checkpoint.
     """
+
+    print(f"Restoring checkpoint from: {path}")
     item, transforms = sharding, None
     restore_args = jax.tree.map(lambda s: ocp.ArrayRestoreArgs(sharding=s), sharding)
     with ocp.PyTreeCheckpointer() as ckptr:
