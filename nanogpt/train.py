@@ -1,27 +1,15 @@
 import os
-
-# These flags are optional. In some cases, you can see a speedup if you are using GPUs,
-# but they are mostly experimental, and have a 50-50 chance of working.
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_triton_gemm_any=true --xla_gpu_enable_latency_hiding_scheduler=true "
-)
-os.environ.update(
-    {
-        "NCCL_LL128_BUFFSIZE": "-2",
-        "NCCL_LL_BUFFSIZE": "-2",
-        "NCCL_PROTO": "SIMPLE,LL,LL128",
-    }
-)
-
-
 import warnings
 import logging
 import time
 from pathlib import Path
 from functools import partial
 
+from fineweb_dataloader import make_grain_shard_loader, BOSFinder
+
 import jax
 import optax
+import grain
 import numpy as np
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
@@ -29,19 +17,19 @@ from jax.sharding import Mesh
 from jax.sharding import set_mesh
 from jax.tree_util import GetAttrKey, SequenceKey, DictKey
 
+
 from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward
 from utils import logical_to_sharding
-from fineweb_dataloader import DataPreloader, BOSFinder, _load_data_shard
 from config import ShardingRules, Config, BATCH_AXIS_NAME
+
 
 logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
 
 
 def compute_loss(params, x_batch, y_batch, freqs):
-    # Logits are already in fp32. If not, ensure to cast them.
     logits = forward(params, x_batch, freqs)
     loss = jnp.mean(
         optax.losses.softmax_cross_entropy_with_integer_labels(
@@ -81,15 +69,14 @@ def line(label, value, comma=False, label_w=30, colon_w=2, value_w=20):
     return f"{label:<{label_w}}{':':<{colon_w}}{value:{fmt}}"
 
 
-def set_layerwise_lr(
+def make_adamw_layerwise_like_nanochat(
     params,
     *,
     d_model: int,
-    other_peak_lr: float,  # peak LR for non-(embed/lm_head)
-    other_min_lr: float,  # end/min LR for non-(embed/lm_head)
+    other_peak_lr: float,
+    other_min_lr: float,
     total_train_steps: int,
     warmup_steps: int = 30,
-    weight_decay: float = 0.001,
     b1: float = 0.9,
     b2: float = 0.95,
     embedding_lr: float = 3e-3,
@@ -105,9 +92,10 @@ def set_layerwise_lr(
     """
 
     # nanochat's width scaling for AdamW groups: (d_model / 768) ** -0.5
-    # This is slowing down learning. TODO: Debug and use it later for scaling lr
-    dmodel_lr_scale = (d_model / 768.0) ** -0.5  # noqa
+    # dmodel_lr_scale = (d_model / 768.0) ** -0.5
 
+    # emb_lr = embedding_lr * dmodel_lr_scale
+    # unemb_lr = unembedding_lr * dmodel_lr_scale
     emb_lr = embedding_lr * other_peak_lr
     unemb_lr = 1.0 * other_peak_lr
 
@@ -148,7 +136,7 @@ def set_layerwise_lr(
 
     param_labels = jax.tree_util.tree_map_with_path(label_fn, params)
 
-    def make_adamw(lr_schedule):
+    def make_adamw(lr_schedule, weight_decay=0.0):
         return optax.adamw(
             learning_rate=lr_schedule,
             b1=b1,
@@ -157,239 +145,325 @@ def set_layerwise_lr(
             mu_dtype=jnp.float32,
         )
 
-    optim = optax.multi_transform(
+    tx = optax.multi_transform(
         {
             "embed": make_adamw(schedules["embed"]),
             "lm_head": make_adamw(schedules["lm_head"]),
-            "other": make_adamw(schedules["other"]),
+            "other": make_adamw(schedules["other"], weight_decay=0.001),
         },
         param_labels,
     )
 
-    return optim
+    return tx
 
 
-# Get the mesh, sharding rules, amd the config
-devices = np.array(jax.devices())
-print("Number of devices found:", len(devices))
-mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
-sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
-cfg = Config(mesh=mesh, rules=sharding_rules)
+def get_next_batch(starts, ends, bsz, seqlen, tokens, data_sharding):
+    """Gathers batches of input-labels pairs.
 
-# Load the model
-print("Building GPT model based on the config...")
-model = GPT.init(jax.random.PRNGKey(0), cfg)
-print("Model built successfully!")
+    Given the `starts` and `ends` of sequences provided by the
+    BOSFinder, this method generates batches of inputs-labels
+    efficiently.
+    """
+    buf_u16 = np.empty((bsz, seqlen + 1), dtype=np.uint16)
 
-
-per_device_bsz = cfg.hparams.per_device_batch_size
-bsz = per_device_bsz * len(devices)
-seqlen = cfg.model.seqlen
-head_dim = cfg.model.attn.head_dim
-data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
-
-max_lr = cfg.hparams.max_lr
-min_lr = 0.01 * max_lr
-warmup_steps = cfg.hparams.warmup_steps
-desired_batch_size = cfg.hparams.desired_batch_size
-
-# Turn off grad_accum for now. MultiStep is behaving in a bad way when branched
-# out for efficiency. Pretty sure, I am doing something stupid, but turn it off
-# for now. It is necessary for squeezing out every ounce of GPU though.
-grad_accum_steps = 1  # max(4, desired_batch_size // (bsz * seqlen))
-
-b1 = cfg.hparams.b1
-b2 = cfg.hparams.b2
-weight_decay = cfg.hparams.weight_decay
-grad_clip_norm = cfg.hparams.grad_clip_norm
-total_train_steps = cfg.hparams.total_train_steps
-max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
-checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
+    ptr = 0
+    for i, j in zip(starts, ends):
+        n = j - i
+        row = ptr // (seqlen + 1)
+        col = ptr % (seqlen + 1)
+        buf_u16[row, col : col + n] = tokens[i:j]
+        ptr += n
+    buf = buf_u16.astype(np.int32, copy=False)
+    x = jax.device_put(buf[:, :-1], data_sharding)
+    y = jax.device_put(buf[:, 1:], data_sharding)
+    return x, y
 
 
-# Optimizer
-optim = optax.chain(
-    optax.clip_by_global_norm(grad_clip_norm),
-    set_layerwise_lr(
-        model,
-        d_model=cfg.model.d_emb,
-        other_peak_lr=max_lr,
-        other_min_lr=min_lr,
-        total_train_steps=total_train_steps,
-        warmup_steps=warmup_steps,
-        weight_decay=weight_decay,
-    ),
-)
-
-# TODO: Turn ot on after debugging
-# optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
-
-optim_state = optim.init(model)
-
-# Checkpointing
-ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir)
-options = ocp.CheckpointManagerOptions(
-    max_to_keep=max_checkpoints_to_keep, save_interval_steps=checkpoint_save_steps
-)
-handlers = {
-    "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
-    "optim_state": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
-}
-
-mngr = ocp.CheckpointManager(ckpt_path, handlers, options=options)
-
-print("\n", "-" * 75, "\n")
-print(line("Number of trainable params: ", count_params(model), comma=True))
-print(line("Sequence length per sample", seqlen))
-print(line("Per device batch size", per_device_bsz))
-print(line("Total batch size", bsz))
-print(line("Grad accumulation steps", grad_accum_steps))
-print()
-print(line("LR (min, max)", str((min_lr, max_lr))))
-print(line("Warmup steps", warmup_steps))
-print(line("Weight decay", weight_decay), "\n")
-print("-" * 75)
+def dataloader_save_args(data_iter, shard_idx, bos_index):
+    meta = {"shard_idx": int(shard_idx), "bos_index": int(bos_index)}
+    return {
+        "data": grain.checkpoint.CheckpointSave(data_iter),
+        "data_meta": ocp.args.JsonSave(meta),
+    }
 
 
-# Compute the frequencies
-positions = jnp.arange(seqlen)[None, :]
-with set_mesh(cfg.mesh):
-    freqs = precompute_frequencies(positions=positions, features=head_dim)
+def dataloader_restore_args(data_iter):
+    return {
+        "data": grain.checkpoint.CheckpointRestore(data_iter),
+        "data_meta": ocp.args.JsonRestore(),
+    }
 
 
-best_loss = float("inf")
-patience = cfg.hparams.es_patience
-patience_counter = 0
-best_step = 0
-last_checkpoint_step = 0
-val_interval = 50
-last_val_loss = None
-num_epochs = 1
-worker_count = 0  # Number of parallel workers for data loading
-worker_buffer_size = 1  # Prefetch buffer size per worker
+def main():
+    # Get the mesh, sharding rules, amd the config
+    devices = np.array(jax.devices())
+    print("Number of devices found:", len(devices))
+    mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
+    sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
+    cfg = Config(mesh=mesh, rules=sharding_rules)
 
-train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
-val_files = list(Path(cfg.data_dir).glob("*val*.bin"))
-num_train_files = len(train_files)
-num_val_files = len(val_files)
-print("\nNumber of train files found: ", num_train_files)
-print("Number of validation files found: ", num_val_files)
+    train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
+    val_files = list(Path(cfg.data_dir).glob("*val*.bin"))
+    num_train_files = len(train_files)
+    num_val_files = len(val_files)
+    print("\nNumber of train files found: ", num_train_files)
+    print("Number of validation files found: ", num_val_files)
+    train_dl = make_grain_shard_loader(
+        train_files,
+        read_options=grain.ReadOptions(num_threads=16, prefetch_buffer_size=256),
+        worker_count=2,
+        custom=True,
+    )
+    val_dl = make_grain_shard_loader(
+        val_files,
+        worker_count=1,
+        read_options=grain.ReadOptions(num_threads=16, prefetch_buffer_size=256),
+    )
+    train_iter = iter(train_dl)
 
-# Load first shard synchronously
-train_iter = iter(train_files)
-val_iter = iter(val_files)
+    per_device_bsz = cfg.hparams.per_device_batch_size
+    bsz = per_device_bsz * len(devices)
+    seqlen = cfg.model.seqlen
+    head_dim = cfg.model.attn.head_dim
+    data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
 
+    max_lr = cfg.hparams.max_lr
+    min_lr = 0.01 * max_lr
+    warmup_steps = cfg.hparams.warmup_steps
+    desired_batch_size = cfg.hparams.desired_batch_size
+    grad_accum_steps = max(2, desired_batch_size // (bsz * seqlen))
 
-train_tokens = _load_data_shard(next(train_iter))
-train_finder = BOSFinder(train_tokens)
-train_preloader = DataPreloader(train_iter, bsz)
+    # b1 = cfg.hparams.b1
+    # b2 = cfg.hparams.b2
+    weight_decay = cfg.hparams.weight_decay
+    grad_clip_norm = cfg.hparams.grad_clip_norm
 
-val_tokens = _load_data_shard(next(val_iter))
-val_finder = BOSFinder(val_tokens)
-val_preloader = DataPreloader(val_iter, bsz)
+    total_train_steps = cfg.hparams.total_train_steps
+    max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
+    checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
 
-step = 0
-print("Starting training (the first step will take some time for compilation...)\n")
-training_complete = False
+    # Load the model
+    print("Building GPT model based on the config...")
+    model = GPT.init(jax.random.PRNGKey(0), cfg)
+    print("Model built successfully!")
 
-# Training loop with explicit counter
-for shard_idx in range(num_train_files):
-    if training_complete:
-        break
-    # Start preloading next shard if not on last shard
-    if shard_idx < num_train_files - 1:
-        train_preloader.start()
+    # Optimizer
+    optim = optax.chain(
+        optax.clip_by_global_norm(grad_clip_norm),
+        make_adamw_layerwise_like_nanochat(
+            model,
+            d_model=cfg.model.d_emb,
+            other_peak_lr=max_lr,
+            other_min_lr=min_lr,
+            total_train_steps=total_train_steps,
+            warmup_steps=warmup_steps,
+        ),
+    )
 
-    shard_processed_fully = False
-    print(f"\n=== Processing Shard {shard_idx + 1}/{num_train_files} ===")
+    # No grad accum for now
+    # optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
+    optim_state = optim.init(model)
 
-    while not shard_processed_fully:
+    # Checkpointing
+    ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir)
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=max_checkpoints_to_keep, save_interval_steps=checkpoint_save_steps
+    )
+    handlers = {
+        "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
+        "optim_state": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
+        "ds": ocp.Checkpointer(grain.checkpoint.CheckpointHandler()),
+    }
+
+    mngr = ocp.CheckpointManager(ckpt_path, handlers, options=options)
+
+    print("")
+    print("-" * 75)
+    print("")
+
+    print(line("Number of trainable params: ", count_params(model), comma=True))
+    print(line("Sequence length per sample", seqlen))
+    print(line("Per device batch size", per_device_bsz))
+    print(line("Total batch size", bsz))
+    print(line("Grad accumulation steps", grad_accum_steps))
+    print()
+    print(line("LR (min, max)", str((min_lr, max_lr))))
+    print(line("Warmup steps", warmup_steps))
+    print(line("Weight decay", weight_decay), "\n")
+    print("-" * 75)
+
+    # Compute the frequencies
+    positions = jnp.arange(seqlen)[None, :]
+    with set_mesh(cfg.mesh):
+        freqs = precompute_frequencies(positions=positions, features=head_dim)
+
+    resume_from_step = cfg.ckpt_cfg.last_checkpoint_step
+
+    if resume_from_step > 0:
+        resume_ckpt_path = os.path.join(cfg.ckpt_cfg.save_ckpt_dir, resume_from_step)
+        if os.path.exists(resume_ckpt_path):
+            from checkpoint_utils import load_checkpoint
+
+            model, optim_state, train_iter = load_checkpoint(
+                mngr, resume_from_step, model, optim_state, mesh, train_iter
+            )
+        else:
+            print(
+                f"Checkpoint path {resume_ckpt_path} not found! Resuming training without restoring checkpoint..."
+            )
+
+    best_loss = float("inf")
+    last_val_loss = float("inf")
+    es_patience = cfg.hparams.es_patience
+    es_patience_counter = 0
+    best_step = 0
+
+    step = resume_from_step
+    print("Starting training (the first step will take some time for compilation...)\n")
+    training_complete = False
+
+    train_start_time = time.time()
+
+    # Training loop with explicit counter
+    for shard in train_iter:
+        if step >= total_train_steps or training_complete:
+            mngr.wait_until_finished()
+            print("Finished checkpointing! Cleaned.")
+            break
+
+        tokens = shard["tokens"]  # SharedMemoryArray(uint16, shape=[num_tokens])
+        bos_idx = shard["bos_idx"]  # np.ndarray of BOS positions
+        size = shard["size"]
+        shard_name = Path(shard["path"]).name
+
         try:
-            start = time.time()
-            train_step_loss = 0.0
-            for micro_step in range(grad_accum_steps):
-                seq_starts, seq_ends = train_finder.next_batch(bsz, seqlen)
-                # TODO: This is bad, and is a bottleneck. Make it more efficient
-                buf = (
-                    np.concatenate(
-                        [train_tokens[i:j] for i, j in zip(seq_starts, seq_ends)]
+            # Optional: reuse your BOSFinder but skip its thread methods.
+            bf = BOSFinder(tokens)
+            bf.bos_idx = bos_idx
+            bf.size = size
+
+            shard_processed_fully = False
+            # print(f"\n=== Processing Shard {shard_idx + 1}/{num_train_files} ===")
+            print(f"\n=== Processing Shard: {shard_name} ====")
+
+            while not shard_processed_fully:
+                try:
+                    start = time.time()
+                    # train_step_loss = 0.0
+                    # for micro_step in range(grad_accum_steps):
+                    #     starts, ends = bf.next_batch(bsz, seqlen)
+                    #     x, y = get_next_batch(starts, ends, bsz, seqlen)
+                    #     if micro_step < grad_accum_steps - 1:
+                    #         model, loss, optim_state = train_step_accum(model, x, y, freqs, optim_state, optim)
+                    #         train_step_loss += loss
+                    #     else:
+                    #         model, loss, optim_state = train_step(model, x, y, freqs, optim_state, optim)
+                    #         train_step_loss += loss
+                    # avg_train_loss = train_step_loss / grad_accum_steps
+                    # if 'resume_bos_index' in locals() and resume_bos_index is not None:
+                    #     print("Resuming from index: ", resume_bos_index)
+                    #     bf.i = int(resume_bos_index)
+                    #     resume_bos_index = None
+                    starts, ends = bf.next_batch(bsz, seqlen)
+                    x, y = get_next_batch(
+                        starts, ends, bsz, seqlen, tokens, data_sharding
                     )
-                    .reshape(bsz, seqlen + 1)
-                    .astype(np.int32)
-                )
-                x = buf[:, :-1]
-                y = buf[:, 1:]
-                x = jax.device_put(x, data_sharding)
-                y = jax.device_put(y, data_sharding)
-                if micro_step < grad_accum_steps - 1:
-                    model, loss, optim_state = train_step_accum(
-                        model, x, y, freqs, optim_state, optim
-                    )
-                    train_step_loss += loss
-                else:
                     model, loss, optim_state = train_step(
                         model, x, y, freqs, optim_state, optim
                     )
-                    train_step_loss += loss
+                    avg_train_loss = loss
 
-            avg_train_loss = train_step_loss / grad_accum_steps
-            step += 1
+                    step += 1
 
-            # Block for accurate timing
-            jax.block_until_ready(avg_train_loss)
+                    # Block for accurate timing
+                    jax.block_until_ready(avg_train_loss)
 
-            end = time.time()
-            dt = end - start
+                    end = time.time()
+                    dt = end - start
 
-            tokens_processed = bsz * seqlen * grad_accum_steps
-            tokens_per_sec = int(tokens_processed / dt)
+                    tokens_processed = bsz * seqlen  # * grad_accum_steps
+                    tokens_per_sec = int(tokens_processed / dt)
 
-            improved = avg_train_loss < best_loss
-            if improved:
-                best_loss = avg_train_loss
-                best_step = step
-                patience_counter = 0
-            else:
-                patience_counter += 1
+                    if (step % options.save_interval_steps) == 0:
+                        mngr.save(
+                            step,
+                            args=ocp.args.Composite(
+                                params=ocp.args.PyTreeSave(model),
+                                optim_state=ocp.args.PyTreeSave(optim_state),
+                                ds=grain.checkpoint.CheckpointSave(train_iter),
+                            ),
+                        )
+                    print(
+                        f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {avg_train_loss:8.4f} | Time taken: {dt:8.2f} s | Tokens processed/s: {tokens_per_sec:>9,}"
+                    )
 
-            if improved or (step % options.save_interval_steps) == 0:
-                mngr.save(
-                    step,
-                    args=ocp.args.Composite(
-                        params=ocp.args.PyTreeSave(model),
-                        optim_state=ocp.args.PyTreeSave(optim_state),
-                    ),
-                )
-            print(
-                f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {avg_train_loss:8.4f} | Time taken: {dt:8.2f} s | Tokens processed/s: {tokens_per_sec:>9,}"
-            )
+                    if step >= total_train_steps:
+                        print(f"\nReached maximum training steps: {total_train_steps}")
+                        mngr.wait_until_finished()
+                        print("Finished checkpointing! Cleaned.")
+                        training_complete = True
+                        break
 
-            # Check stopping conditions
-            if patience_counter > patience:
-                print(
-                    f"\nEarly stopping triggered! No improvement for {patience} steps."
-                )
-                print(f"Best loss: {best_loss:.4f} at step {best_step}")
-                mngr.wait_until_finished()
-                training_complete = True  # ← Set flag
-                break  # ← Break inner loop
+                except StopIteration:
+                    # Once we have trained on one shard, let's validate the performance as well
+                    print(
+                        "Shard exhausted. Scoring model performance on validation data now..."
+                    )
+                    val_loss = 0.0
+                    val_steps_count = 0
+                    for shard in val_dl:
+                        tokens = shard["tokens"]
+                        bos_idx = shard["bos_idx"]
+                        size = shard["size"]
 
-            if step >= total_train_steps:
-                print(f"\nReached maximum training steps: {total_train_steps}")
-                mngr.wait_until_finished()
-                print("Finished checkpointing! Cleaned.")
-                training_complete = True  # ← Set flag
-                break  # ← Break inner loop
+                        try:
+                            bf = BOSFinder(tokens)
+                            bf.bos_idx = bos_idx
+                            bf.size = size
+                            starts, ends = bf.next_batch(bsz, seqlen)
+                            x, y = get_next_batch(
+                                starts, ends, bsz, seqlen, tokens, data_sharding
+                            )
+                            loss = val_step(model, x, y, freqs)
+                            val_loss += loss
+                            val_steps_count += 1
+                        except StopIteration:
+                            break
+                        finally:
+                            tokens.unlink_on_del()
+                    avg_val_loss = val_loss / val_steps_count
+                    jax.block_until_ready(avg_val_loss)
 
-        except StopIteration:
-            print(f"{shard_idx + 1}/{num_train_files} shard processed fully.")
-            shard_processed_fully = True
+                    improved = avg_val_loss < best_loss
+                    if improved:
+                        best_loss = avg_val_loss
+                        best_step = step
+                        es_patience_counter = 0
+                    else:
+                        es_patience_counter += 1
 
-    # Load next shard if available
-    if shard_idx < num_train_files - 1:
-        train_tokens, train_finder = train_preloader.get()
+                    if es_patience_counter > es_patience:
+                        print(
+                            f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps."
+                        )
+                        print(f"Best loss: {best_loss:.4f} at step {best_step}")
+                        mngr.wait_until_finished()
+                        tokens.unlink_on_del()
+                        training_complete = True
+                        break
 
-    if step >= total_train_steps or training_complete:
-        mngr.wait_until_finished()
-        print("Finished checkpointing! Cleaned.")
-        break
+                    print(
+                        f"last_val_loss: {last_val_loss:.4f} curr_val_loss:{avg_val_loss:.4f}\n"
+                    )
+                    last_val_loss = avg_val_loss
+                    shard_processed_fully = True
+        finally:
+            tokens.unlink_on_del()
+    train_end_time = time.time()
+    print(
+        f"\nTotal time taken to train the model: {(train_end_time - train_start_time) / 60:.2f} minutes"
+    )
+
+
+if __name__ == "__main__":
+    main()
