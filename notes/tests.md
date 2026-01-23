@@ -135,3 +135,11 @@ for _ in range(10):
 
 We got rid of the above bug by explicitly copying the `k` and `v` values into new arrays. Without creating an extra copy, it is not possible
 to make the array contiguous as transpose is just a view in the end. It works now. 
+
+
+---
+
+# Optimizations
+
+- Both adamw and muon works well. We achieve the same validation loss as achieved by `nanochat` and `modded-nanogpt`.
+- We still have not applied any tricks, yet the throughput, the optimization, and the model outputs all are in great shape.
