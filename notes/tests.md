@@ -146,3 +146,56 @@ to make the array contiguous as transpose is just a view in the end. It works no
 - I am not sure how important the document boundary is for pretraining. As of now, the grain processes takes 500MB on
 each GPU which is not good, and because of the process finding bos tokens and generating sequences on the fly, there
 are times when the GPU utilization becomes poor. Though it's not that bad, but I would love to get rid of any bubble in the data loading pipeline. 
+
+
+# Muon
+
+Though it is straightforward to use muon in JAX (thanks to Optax!), but there are a few nuances that one needs to be aware of. Muon can be applied to any high
+rank array, but we need to make it aware of those dimensions, otherwise those leaves won't get muon benefits. For example, in our codebase the attention
+weights are 3D arrays as opposed to 2D. The reason we have kept them in 3D is because sharding becomes extremely easy. A side effect of this is that we need to
+make muon aware of this to ensure that arrays are rehsape properly for orthogonalization, otheriwse they are assumed to be 2D. Here is an example:
+
+```python
+ef make_muon(lr_schedule, weight_decay=0.0):
+    def muon_dims_fn(p):
+        def choose(x):
+            s = getattr(x, "shape", None)
+            if s is None:
+                return None
+            if len(s) == 2:
+                return optax.contrib.MuonDimensionNumbers((0,), (1,))
+            if len(s) == 3:
+                if s[-1] == d_model:
+                    return optax.contrib.MuonDimensionNumbers((0, 1), (2,))
+                return optax.contrib.MuonDimensionNumbers((0,), (1, 2))
+            return None
+        return jax.tree_util.tree_map(choose, p)
+
+    def wd_mask_fn(p):
+        def keep(x):
+            s = getattr(x, "shape", None)
+            return s is not None and len(s) >= 2
+        return jax.tree_util.tree_map(keep, p)
+
+    optim = optax.contrib.muon(
+        learning_rate=lr_schedule,
+        ns_coeffs=(3.4445, -4.775, 2.0315),
+        ns_steps=5,
+        beta=b2,
+        eps=1e-8,
+        weight_decay=weight_decay,
+        weight_decay_mask=wd_mask_fn,
+        mu_dtype=jnp.float32,
+        nesterov=True,
+        adaptive=False,
+        adam_b1=b1,
+        adam_b2=b2,
+        adam_eps_root=0.0,
+        adam_weight_decay=weight_decay,
+        adam_learning_rate=None,
+        muon_weight_dimension_numbers=muon_dims_fn,
+    )
+```
+
+Though the above implementation works perfectly and converges very quickly compared to `AdamW`, we take a big hit on the throughput. For example, if a single
+H100 instance was processing almost 400K tokens/second with `adamw`, switching to the above will reduce the throughput to 300-330K tokens/second. That's a big hit!
