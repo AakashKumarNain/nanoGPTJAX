@@ -199,3 +199,53 @@ ef make_muon(lr_schedule, weight_decay=0.0):
 
 Though the above implementation works perfectly and converges very quickly compared to `AdamW`, we take a big hit on the throughput. For example, if a single
 H100 instance was processing almost 400K tokens/second with `adamw`, switching to the above will reduce the throughput to 300-330K tokens/second. That's a big hit!
+
+Why the drop, one may ask? The `Newton–Schulz orthogonalization` adds extra matmuls, and if you flatten across a sharded axis it also triggers extra cross‑device collectives. Both effects reduce tokens/s by roughly 5–15% in practice. An easy to get back close to the original throughput is to ensure Muon orthogonalize “locally” by treating the sharded head axis as a batch axis (so no collectives across heads). For example, `wq/wk/wv (d_emb, heads, head_dim): use reduction=(0,), output=(2,)` and leave heads as batch. Similarly, `wo (heads, head_dim, d_emb): use reduction=(1,), output=(2,)` and leave heads as batch. This still gives the intended 2D matrix per head, but avoids flattening across heads. Optax supports this directly via muon_weight_dimension_numbers. We can
+also bring down Newton–Schulz iterations to 3. 
+
+```python
+def make_weight_dim_nums(p):
+    def choose(x):
+        s = getattr(x, "shape", None)
+        if s is None:
+            return None
+        if len(s) == 2:
+            return optax.contrib.MuonDimensionNumbers((0,), (1,))
+        if len(s) == 3:
+            if s[-1] == d_model: # wo: (heads, head_dim, d_model)
+                return optax.contrib.MuonDimensionNumbers((1,), (2,))
+            return optax.contrib.MuonDimensionNumbers((0,), (2,))  # wq/wk/wv: batch=heads
+        return None
+    return jax.tree_util.tree_map(choose, p)
+
+
+def weight_decay_mask_fn(p):
+    def keep(x):
+        s = getattr(x, "shape", None)
+        return s is not None and len(s) >= 2
+    return jax.tree_util.tree_map(keep, p)
+
+
+muon_weight_dim_nums = make_weight_dim_nums(params)
+muon_wd_mask = weight_decay_mask_fn(params)
+
+def make_muon(lr_schedule, weight_decay=0.0):
+    return optax.contrib.muon(
+        learning_rate=lr_schedule,
+        ns_coeffs=(3.4445, -4.775, 2.0315),
+        ns_steps=3,
+        beta=b2,
+        eps=1e-8,
+        weight_decay=weight_decay,
+        weight_decay_mask=muon_wd_mask,
+        mu_dtype=jnp.float32,
+        nesterov=True,
+        adaptive=False,
+        adam_b1=b1,
+        adam_b2=b2,
+        adam_eps_root=0.0,
+        adam_weight_decay=weight_decay,
+        adam_learning_rate=None,
+        muon_weight_dimension_numbers=muon_dims_fn,
+    )
+```
