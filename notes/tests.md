@@ -143,3 +143,6 @@ to make the array contiguous as transpose is just a view in the end. It works no
 
 - Both adamw and muon works well. We achieve the same validation loss as achieved by `nanochat` and `modded-nanogpt`.
 - We still have not applied any tricks, yet the throughput, the optimization, and the model outputs all are in great shape.
+- I am not sure how important the document boundary is for pretraining. As of now, the grain processes takes 500MB on
+each GPU which is not good, and because of the process finding bos tokens and generating sequences on the fly, there
+are times when the GPU utilization becomes poor. Though it's not that bad, but I would love to get rid of any bubble in the data loading pipeline. 
