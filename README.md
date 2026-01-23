@@ -84,7 +84,32 @@ load_ckpt_path = /home/.../params  # absolute path only
 # Run the inference code
 python nanogpt/inference.py
 ```
+<br>
 
+## Results
+
+After pretraining the model on first 30 shards of Fineweb10B tokens, here are some sample outputs from the mode:
+
+```
+prompts = [
+        "<|endoftext|>Did you notice that this world",
+        "<|endoftext|>Hello World! My dear",
+        "<|endoftext|>Some say we are tired far",
+        "<|endoftext|>Hear that?",
+    ]
+---
+
+Completions:
+
+<|endoftext|>Did you notice that this world is filled with so many details and characters that children deserve? Does it feel like money and art hasn't stopped up the world of fantasy that it is obsessed with? Perhaps a cat ate ice cream while I screamed till the last minute. Or the things
+
+<|endoftext|>Hello World! My dear friend Wendy who lives in Helsinki and it has been a great experience to have met some amazing new people at such amazing places! Many of these photos have not been taken since I arrived in Helsinki. While my colleagues quite frequently comment on how wonderful the locations
+
+<|endoftext|>Some say we are tired far too soon. Unfortunately, a few weeks ago, my friend Julie Dossakis had her wedding day from a newly beautiful downtown Hotel with her gorgeous smile at the thought of the occasion. She said that “I’m going to just dress
+
+<|endoftext|>Hear that? I run across while I sit on a station wagon in The Village Voice and the car stays silent and beeps. What is that like? Find out on one of our monthly Community Radio shows.\nTalk about the power of truth! Podcast Series\n
+```
+<br>
 
 ## Benchmarking 
 
