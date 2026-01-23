@@ -134,8 +134,18 @@ def sample_from_model(
         prompts, allowed_special={"<|endoftext|>", "<|pad|>"}
     )
     input_ids, segment_ids = pad_tokens(
-        encoded, pad_to_power_of_two=pad_to_power_of_two
+        encoded,
+        pad_id=pad_id,
+        pad_to_power_of_two=pad_to_power_of_two
     )
+
+    # cache_key, decode_key = jax.random.split(key)
+    
+    # In case you want to reproduce the outputs shown in the Readme,
+    # you can use these keys for cache and decoding
+
+    # cache_key = jax.random.PRNGKey(1)
+    # decode_key = jax.random.PRNGKey(5)
 
     cache_key, decode_key = jax.random.split(key)
 
@@ -198,7 +208,7 @@ if __name__ == "__main__":
 
     PAD_ID = tokenizer.encode(PAD_TOKEN, allowed_special={"<|pad|>"})[0]
     max_new_tokens = 100
-    top_k = None
+    top_k = 500
 
     jax.set_mesh(cfg.mesh)
 
@@ -221,11 +231,11 @@ if __name__ == "__main__":
         )
     print("Warming up complete!\nGenerating...")
 
-    prompts = [
+    rompts = [
         "<|endoftext|>Did you notice that this world",
-        "<|endoftext|>Hear that?",
         "<|endoftext|>Hello World! My dear",
         "<|endoftext|>Some say we are tired far",
+        "<|endoftext|>Hear that?",
     ]
     key, subkey = jax.random.split(key)
     start = time.perf_counter()
@@ -241,7 +251,7 @@ if __name__ == "__main__":
     )
     end = time.perf_counter()
     print(
-        f"Time taken to generate {max_new_tokens * len(prompts)} tokens: {(end - start) * 1000:.2f} ms\n"
+        f"\nTime taken to generate {max_new_tokens * len(prompts)} tokens: {(end - start):.2f} seconds\n"
     )
     decoded = tokenizer.decode_batch(out.tolist())
 
