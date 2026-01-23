@@ -69,7 +69,7 @@ def line(label, value, comma=False, label_w=30, colon_w=2, value_w=20):
     return f"{label:<{label_w}}{':':<{colon_w}}{value:{fmt}}"
 
 
-def make_adamw_layerwise_like_nanochat(
+def build_optimizer(
     params,
     *,
     d_model: int,
@@ -81,6 +81,7 @@ def make_adamw_layerwise_like_nanochat(
     b2: float = 0.95,
     embedding_lr: float = 3e-3,
     unembedding_lr: float = 3e-4,
+    use_muon=True,
 ):
     """
     Parameter groups:
@@ -98,6 +99,9 @@ def make_adamw_layerwise_like_nanochat(
     # unemb_lr = unembedding_lr * dmodel_lr_scale
     emb_lr = embedding_lr * other_peak_lr
     unemb_lr = 1.0 * other_peak_lr
+
+    if use_muon:
+        other_peak_lr = max(other_peak_lr, 2e-2)
 
     schedules = {
         "embed": optax.constant_schedule(emb_lr),
@@ -145,11 +149,33 @@ def make_adamw_layerwise_like_nanochat(
             mu_dtype=jnp.float32,
         )
 
+    def make_muon(lr_schedule, weight_decay=0.0):
+        return optax.contrib.muon(
+            learning_rate=lr_schedule,
+            ns_coeffs=(3.4445, -4.775, 2.0315),
+            ns_steps=5,
+            beta=b2,
+            eps=1e-8,
+            weight_decay=weight_decay,
+            mu_dtype=jnp.float32,
+            nesterov=True,
+            adaptive=False,
+            adam_b1=b1,
+            adam_b2=b2,
+            adam_eps_root=0.0,
+            adam_weight_decay=weight_decay,
+            muon_weight_dimension_numbers=None,
+            consistent_rms=None,
+        )
+
+    # then change only the "other" branch of the multi_transform to use Muon
     tx = optax.multi_transform(
         {
             "embed": make_adamw(schedules["embed"]),
             "lm_head": make_adamw(schedules["lm_head"]),
-            "other": make_adamw(schedules["other"], weight_decay=0.001),
+            "other": make_muon(schedules["other"], weight_decay=0.001)
+            if use_muon
+            else make_adamw(schedules["other"], weight_decay=0.001),
         },
         param_labels,
     )
@@ -231,10 +257,10 @@ def main():
     min_lr = 0.01 * max_lr
     warmup_steps = cfg.hparams.warmup_steps
     desired_batch_size = cfg.hparams.desired_batch_size
-    grad_accum_steps = max(2, desired_batch_size // (bsz * seqlen))
+    grad_accum_steps = 1  # max(4, desired_batch_size // (bsz * seqlen))
 
-    # b1 = cfg.hparams.b1
-    # b2 = cfg.hparams.b2
+    b1 = cfg.hparams.b1
+    b2 = cfg.hparams.b2
     weight_decay = cfg.hparams.weight_decay
     grad_clip_norm = cfg.hparams.grad_clip_norm
 
@@ -250,18 +276,21 @@ def main():
     # Optimizer
     optim = optax.chain(
         optax.clip_by_global_norm(grad_clip_norm),
-        make_adamw_layerwise_like_nanochat(
+        build_optimizer(
             model,
             d_model=cfg.model.d_emb,
             other_peak_lr=max_lr,
             other_min_lr=min_lr,
             total_train_steps=total_train_steps,
             warmup_steps=warmup_steps,
+            use_muon=True,
         ),
     )
 
     # No grad accum for now
-    # optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
+    if grad_accum_steps > 1:
+        print("Applying grad accum schedule to the optimizer...")
+        optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
     optim_state = optim.init(model)
 
     # Checkpointing
@@ -317,11 +346,10 @@ def main():
     es_patience = cfg.hparams.es_patience
     es_patience_counter = 0
     best_step = 0
-
+    num_shards_used = 0
     step = resume_from_step
-    print("Starting training (the first step will take some time for compilation...)\n")
     training_complete = False
-
+    print("Starting training (the first step will take some time for compilation...)\n")
     train_start_time = time.time()
 
     # Training loop with explicit counter
@@ -343,16 +371,14 @@ def main():
             bf.size = size
 
             shard_processed_fully = False
-            # print(f"\n=== Processing Shard {shard_idx + 1}/{num_train_files} ===")
-            print(f"\n=== Processing Shard: {shard_name} ====")
-
+            print(f"\n=== Processing Shard: {num_shards_used} with name: {shard_name} ====")  # fmt: off
             while not shard_processed_fully:
                 try:
                     start = time.time()
                     # train_step_loss = 0.0
                     # for micro_step in range(grad_accum_steps):
                     #     starts, ends = bf.next_batch(bsz, seqlen)
-                    #     x, y = get_next_batch(starts, ends, bsz, seqlen)
+                    #     x, y = get_next_batch(starts, ends, bsz, seqlen, tokens, data_sharding)
                     #     if micro_step < grad_accum_steps - 1:
                     #         model, loss, optim_state = train_step_accum(model, x, y, freqs, optim_state, optim)
                     #         train_step_loss += loss
@@ -360,10 +386,12 @@ def main():
                     #         model, loss, optim_state = train_step(model, x, y, freqs, optim_state, optim)
                     #         train_step_loss += loss
                     # avg_train_loss = train_step_loss / grad_accum_steps
+
                     # if 'resume_bos_index' in locals() and resume_bos_index is not None:
                     #     print("Resuming from index: ", resume_bos_index)
                     #     bf.i = int(resume_bos_index)
                     #     resume_bos_index = None
+
                     starts, ends = bf.next_batch(bsz, seqlen)
                     x, y = get_next_batch(
                         starts, ends, bsz, seqlen, tokens, data_sharding
@@ -381,7 +409,7 @@ def main():
                     end = time.time()
                     dt = end - start
 
-                    tokens_processed = bsz * seqlen  # * grad_accum_steps
+                    tokens_processed = bsz * seqlen * grad_accum_steps
                     tokens_per_sec = int(tokens_processed / dt)
 
                     if (step % options.save_interval_steps) == 0:
@@ -398,7 +426,12 @@ def main():
                     )
 
                     if step >= total_train_steps:
-                        print(f"\nReached maximum training steps: {total_train_steps}")
+                        print(
+                            f"\nReached maximum training steps: {total_train_steps}",
+                            end=" ",
+                        )
+                        print(f"Total number of shards consumed: {num_shards_used}")
+                        print(f"Best loss: {best_loss:.4f} at step {best_step}")
                         mngr.wait_until_finished()
                         print("Finished checkpointing! Cleaned.")
                         training_complete = True
@@ -406,8 +439,9 @@ def main():
 
                 except StopIteration:
                     # Once we have trained on one shard, let's validate the performance as well
+                    num_shards_used += 1
                     print(
-                        "Shard exhausted. Scoring model performance on validation data now..."
+                        f"Shard exhuasted. Number of shards consumed till now: {num_shards_used}. Scoring model performance on vdalidation data..."
                     )
                     val_loss = 0.0
                     val_steps_count = 0
@@ -444,8 +478,10 @@ def main():
 
                     if es_patience_counter > es_patience:
                         print(
-                            f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps."
+                            f"\nEarly stopping triggered! No improvement on validation loss for {es_patience_counter} steps.",
+                            end=" ",
                         )
+                        print(f"Total number of shards consumed: {num_shards_used}")
                         print(f"Best loss: {best_loss:.4f} at step {best_step}")
                         mngr.wait_until_finished()
                         tokens.unlink_on_del()
@@ -453,7 +489,7 @@ def main():
                         break
 
                     print(
-                        f"last_val_loss: {last_val_loss:.4f} curr_val_loss:{avg_val_loss:.4f}\n"
+                        f"last_val_loss: {last_val_loss:.4f} curr_val_loss:{avg_val_loss:.4f} Best loss: {best_loss:.4f} at step {best_step}\n"
                     )
                     last_val_loss = avg_val_loss
                     shard_processed_fully = True
