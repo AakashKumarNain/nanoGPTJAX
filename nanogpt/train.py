@@ -72,16 +72,17 @@ def line(label, value, comma=False, label_w=30, colon_w=2, value_w=20):
 def build_optimizer(
     params,
     *,
-    d_model: int,
-    other_peak_lr: float,
-    other_min_lr: float,
+    d_model: int,                    
+    other_peak_lr: float,           
+    other_min_lr: float,            
     total_train_steps: int,
     warmup_steps: int = 30,
-    b1: float = 0.9,
-    b2: float = 0.95,
+    b1: float = 0.9,                
+    b2: float = 0.95,           
     embedding_lr: float = 3e-3,
     unembedding_lr: float = 3e-4,
-    use_muon=True,
+    use_muon=True
+
 ):
     """
     Parameter groups:
@@ -101,6 +102,7 @@ def build_optimizer(
     unemb_lr = 1.0 * other_peak_lr
 
     if use_muon:
+        print("Using Muon Optimizer!")
         other_peak_lr = max(other_peak_lr, 2e-2)
 
     schedules = {
@@ -146,17 +148,43 @@ def build_optimizer(
             b1=b1,
             b2=b2,
             weight_decay=weight_decay,
-            mu_dtype=jnp.float32,
+            mu_dtype=jnp.float32
         )
+
+    def make_weight_dim_nums(p):
+        def choose(x):
+            s = getattr(x, "shape", None)
+            if s is None:
+                return None
+            if len(s) == 2:
+                return optax.contrib.MuonDimensionNumbers((0,), (1,))
+            if len(s) == 3:
+                if s[-1] == d_model:       # wo: (heads, head_dim, d_model)
+                    return optax.contrib.MuonDimensionNumbers((1,), (2,))
+                return optax.contrib.MuonDimensionNumbers((0,), (2,))  # wq/wk/wv: batch=heads
+            return None
+        return jax.tree_util.tree_map(choose, p)
+
+    def weight_decay_mask_fn(p):
+        def keep(x):
+            s = getattr(x, "shape", None)
+            return s is not None and len(s) >= 2
+        return jax.tree_util.tree_map(keep, p)
+
+    
+    muon_weight_dim_nums = make_weight_dim_nums(params)
+    muon_wd_mask = weight_decay_mask_fn(params)
+
 
     def make_muon(lr_schedule, weight_decay=0.0):
         return optax.contrib.muon(
             learning_rate=lr_schedule,
-            ns_coeffs=(3.4445, -4.775, 2.0315),
-            ns_steps=5,
+            ns_coeffs=(3.4445, -4.775, 2.0315), 
+            ns_steps=3,
             beta=b2,
             eps=1e-8,
             weight_decay=weight_decay,
+            weight_decay_mask=muon_wd_mask,
             mu_dtype=jnp.float32,
             nesterov=True,
             adaptive=False,
@@ -164,18 +192,15 @@ def build_optimizer(
             adam_b2=b2,
             adam_eps_root=0.0,
             adam_weight_decay=weight_decay,
-            muon_weight_dimension_numbers=None,
-            consistent_rms=None,
+            muon_weight_dimension_numbers=muon_weight_dim_nums,
+            consistent_rms=None
         )
 
-    # then change only the "other" branch of the multi_transform to use Muon
     tx = optax.multi_transform(
         {
             "embed": make_adamw(schedules["embed"]),
             "lm_head": make_adamw(schedules["lm_head"]),
-            "other": make_muon(schedules["other"], weight_decay=0.001)
-            if use_muon
-            else make_adamw(schedules["other"], weight_decay=0.001),
+            "other": make_muon(schedules["other"], weight_decay=0.001) if use_muon else make_adamw(schedules["other"], weight_decay=0.001),
         },
         param_labels,
     )
@@ -291,6 +316,7 @@ def main():
     if grad_accum_steps > 1:
         print("Applying grad accum schedule to the optimizer...")
         optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
+
     optim_state = optim.init(model)
 
     # Checkpointing
