@@ -263,15 +263,10 @@ def main():
     print("\nNumber of train files found: ", num_train_files)
     print("Number of validation files found: ", num_val_files)
     train_dl = make_grain_shard_loader(
-        train_files,
-        read_options=grain.ReadOptions(num_threads=16, prefetch_buffer_size=256),
-        worker_count=2,
-        custom=True,
+        train_files, prefetch=2, num_threads=16, prefetch_buffer_size=256
     )
     val_dl = make_grain_shard_loader(
-        val_files,
-        worker_count=1,
-        read_options=grain.ReadOptions(num_threads=16, prefetch_buffer_size=256),
+        val_files, prefetch=0, num_threads=16, prefetch_buffer_size=256
     )
     train_iter = iter(train_dl)
 
