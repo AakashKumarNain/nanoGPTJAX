@@ -356,7 +356,7 @@ def main():
     resume_from_step = cfg.ckpt_cfg.last_checkpoint_step
 
     if resume_from_step > 0:
-        resume_ckpt_path = os.path.join(cfg.ckpt_cfg.save_ckpt_dir, resume_from_step)
+        resume_ckpt_path = os.path.join(cfg.ckpt_cfg.save_ckpt_dir, str(resume_from_step))
         if os.path.exists(resume_ckpt_path):
             from checkpoint_utils import load_checkpoint
 
