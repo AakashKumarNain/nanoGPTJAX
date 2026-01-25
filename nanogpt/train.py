@@ -364,6 +364,7 @@ def main():
                 mngr, resume_from_step, model, optim_state, mesh, train_iter
             )
         else:
+            resume_from_step = 0
             print(
                 f"Checkpoint path {resume_ckpt_path} not found! Resuming training without restoring checkpoint..."
             )
