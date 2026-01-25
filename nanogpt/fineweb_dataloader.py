@@ -113,6 +113,7 @@ import grain
 import numpy as np
 from pathlib import Path
 from grain.multiprocessing import SharedMemoryArray
+from grain.experimental import ThreadPrefetchIterDataset
 
 
 BOS_ID = 50256
@@ -271,40 +272,37 @@ class LoadShardTokens(grain.transforms.Map):
         }
 
 
-def make_grain_shard_loader(files, worker_count=4, read_options=None, custom=False):
-    # files should be a list of pathlib.Path or str
-    # source = grain.sources.SharedMemoryDataSource([str(p) for p in files])
-    if custom:
-        files = [str(p) for p in files]
-        source = CustomSharedMemoryDataSource(files, name="fineweb10b")
-    else:
-        files = [str(p) for p in files]
-        source = grain.sources.SharedMemoryDataSource(files)
-    sampler = grain.samplers.SequentialSampler(num_records=len(source))
-    ops = [LoadShardTokens()]
-    return grain.DataLoader(
-        data_source=source,
-        sampler=sampler,
-        operations=ops,
-        worker_count=worker_count,
-        read_options=read_options,
+# def make_grain_shard_loader(files, worker_count=4, read_options=None, custom=False):
+#     # files should be a list of pathlib.Path or str
+#     # source = grain.sources.SharedMemoryDataSource([str(p) for p in files])
+#     if custom:
+#         files = [str(p) for p in files]
+#         source = CustomSharedMemoryDataSource(files, name="fineweb10b")
+#     else:
+#         files = [str(p) for p in files]
+#         source = grain.sources.SharedMemoryDataSource(files)
+#     sampler = grain.samplers.SequentialSampler(num_records=len(source))
+#     ops = [LoadShardTokens()]
+#     return grain.DataLoader(
+#         data_source=source,
+#         sampler=sampler,
+#         operations=ops,
+#         worker_count=worker_count,
+#         read_options=read_options,
+#     )
+
+
+def make_grain_shard_loader(
+    files, prefetch=2, num_threads=16, prefetch_buffer_size=256
+):
+    read_opts = grain.ReadOptions(
+        num_threads=num_threads, prefetch_buffer_size=prefetch_buffer_size
     )
-
-
-# def make_grain_shard_loader(files, prefetch=2, worker_count=1):
-#     from grain.experimental import ThreadPrefetchIterDataset
-#     ds = grain.MapDataset.source([str(p) for p in files]).map(LoadShardTokens()).to_iter_dataset()
-#     if prefetch > 0:
-#         ds = ThreadPrefetchIterDataset(ds, prefetch_buffer_size=prefetch)
-#     return ds
-
-# def make_grain_shard_loader(files, prefetch=2, worker_count=1, num_threads=16, read_buffer_size=500):
-#     from grain.experimental import ThreadPrefetchIterDataset
-
-#     read_opts = grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=read_buffer_size)
-#     ds = grain.MapDataset.source([str(p) for p in files]).map(LoadShardTokens()).to_iter_dataset(read_options=read_opts)
-
-#     if prefetch > 0:
-#         ds = ThreadPrefetchIterDataset(ds, prefetch_buffer_size=prefetch)
-
-#     return ds
+    ds = (
+        grain.MapDataset.source([str(p) for p in files])
+        .map(LoadShardTokens())
+        .to_iter_dataset(read_options=read_opts)
+    )
+    if prefetch > 0:
+        ds = ThreadPrefetchIterDataset(ds, prefetch_buffer_size=prefetch)
+    return ds
