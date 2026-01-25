@@ -126,8 +126,80 @@ class BOSFinder:
         self.bos_idx = np.where(tokens == BOS_ID)[0]
         self.i = 0
         self.batch_iter = 0
+        # lazy: do not allocate index until build(...) is called
+        self.built_ready = False
+
+    def build(self, batch_size, max_seq_len):
+        # Precompute a static index of all (start, end) pairs for every full batch in this shard
+        # starting from the beginning of the shard. Resets iteration counters.
+        n = len(self.bos_idx)
+        target_len = max_seq_len + 1
+        starts = []
+        ends = []
+        ptrs = [0]  # cumulative count of pairs; one entry per completed batch
+        idx = 0  # cursor into bos_idx
+
+        while True:
+            batch_pairs_begin = len(starts)
+            full_batch = True
+            for i in range(batch_size):
+                cur_len = 0
+                while cur_len < target_len:
+                    if idx >= n:
+                        full_batch = False
+                        break
+                    cur = self.bos_idx[idx]
+                    starts.append(cur)
+
+                    remaining = target_len - cur_len
+                    next_bos = self.bos_idx[idx + 1] if idx + 1 < n else self.size
+
+                    end = min(next_bos, cur + remaining)
+                    ends.append(end)
+
+                    cur_len += end - cur
+                    idx += 1
+                if not full_batch:
+                    break
+                assert cur_len == target_len
+            if not full_batch:
+                # rollback any partial pairs for the incomplete batch
+                del starts[batch_pairs_begin:]
+                del ends[batch_pairs_begin:]
+                break
+            ptrs.append(len(starts))
+
+        # store as numpy for compactness and fast slicing
+        self.built_starts = np.asarray(starts, dtype=np.int32)
+        self.built_ends = np.asarray(ends, dtype=np.int32)
+        self.built_ptrs = np.asarray(ptrs, dtype=np.int64)
+        self.built_batch_size = batch_size
+        self.built_max_seq_len = max_seq_len
+        self.built_ready = True
+        self.i = 0
+        self.batch_iter = 0
+        return len(self.built_ptrs) - 1  # number of full batches indexed
 
     def next_batch(self, batch_size: int, max_seq_len: int):
+        # Fast path: use prebuilt index if available and matching request
+        if (
+            self.built_ready
+            and self.built_batch_size == batch_size
+            and self.built_max_seq_len == max_seq_len
+        ):
+            b = self.batch_iter
+            if b >= len(self.built_ptrs) - 1:
+                raise StopIteration("Insufficient BOS ahead; hit tail of shard.")
+            p0 = int(self.built_ptrs[b])
+            p1 = int(self.built_ptrs[b + 1])
+            starts = self.built_starts[p0:p1].tolist()
+            ends = self.built_ends[p0:p1].tolist()
+            # keep original counters consistent
+            self.i += p1 - p0
+            self.batch_iter += 1
+            return starts, ends
+
+        # Original on-the-fly path (unchanged logic)
         n = len(self.bos_idx)
         starts = []
         ends = []
