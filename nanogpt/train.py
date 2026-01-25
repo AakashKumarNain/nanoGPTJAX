@@ -72,17 +72,16 @@ def line(label, value, comma=False, label_w=30, colon_w=2, value_w=20):
 def build_optimizer(
     params,
     *,
-    d_model: int,                    
-    other_peak_lr: float,           
-    other_min_lr: float,            
+    d_model: int,
+    other_peak_lr: float,
+    other_min_lr: float,
     total_train_steps: int,
     warmup_steps: int = 30,
-    b1: float = 0.9,                
-    b2: float = 0.95,           
+    b1: float = 0.9,
+    b2: float = 0.95,
     embedding_lr: float = 3e-3,
     unembedding_lr: float = 3e-4,
-    use_muon=True
-
+    use_muon=True,
 ):
     """
     Parameter groups:
@@ -148,7 +147,7 @@ def build_optimizer(
             b1=b1,
             b2=b2,
             weight_decay=weight_decay,
-            mu_dtype=jnp.float32
+            mu_dtype=jnp.float32,
         )
 
     def make_weight_dim_nums(p):
@@ -159,27 +158,29 @@ def build_optimizer(
             if len(s) == 2:
                 return optax.contrib.MuonDimensionNumbers((0,), (1,))
             if len(s) == 3:
-                if s[-1] == d_model:       # wo: (heads, head_dim, d_model)
+                if s[-1] == d_model:  # wo: (heads, head_dim, d_model)
                     return optax.contrib.MuonDimensionNumbers((1,), (2,))
-                return optax.contrib.MuonDimensionNumbers((0,), (2,))  # wq/wk/wv: batch=heads
+                return optax.contrib.MuonDimensionNumbers(
+                    (0,), (2,)
+                )  # wq/wk/wv: batch=heads
             return None
+
         return jax.tree_util.tree_map(choose, p)
 
     def weight_decay_mask_fn(p):
         def keep(x):
             s = getattr(x, "shape", None)
             return s is not None and len(s) >= 2
+
         return jax.tree_util.tree_map(keep, p)
 
-    
     muon_weight_dim_nums = make_weight_dim_nums(params)
     muon_wd_mask = weight_decay_mask_fn(params)
-
 
     def make_muon(lr_schedule, weight_decay=0.0):
         return optax.contrib.muon(
             learning_rate=lr_schedule,
-            ns_coeffs=(3.4445, -4.775, 2.0315), 
+            ns_coeffs=(3.4445, -4.775, 2.0315),
             ns_steps=3,
             beta=b2,
             eps=1e-8,
@@ -193,14 +194,16 @@ def build_optimizer(
             adam_eps_root=0.0,
             adam_weight_decay=weight_decay,
             muon_weight_dimension_numbers=muon_weight_dim_nums,
-            consistent_rms=None
+            consistent_rms=None,
         )
 
     tx = optax.multi_transform(
         {
             "embed": make_adamw(schedules["embed"]),
             "lm_head": make_adamw(schedules["lm_head"]),
-            "other": make_muon(schedules["other"], weight_decay=0.001) if use_muon else make_adamw(schedules["other"], weight_decay=0.001),
+            "other": make_muon(schedules["other"], weight_decay=0.001)
+            if use_muon
+            else make_adamw(schedules["other"], weight_decay=0.001),
         },
         param_labels,
     )
@@ -282,7 +285,7 @@ def main():
     min_lr = 0.01 * max_lr
     warmup_steps = cfg.hparams.warmup_steps
     desired_batch_size = cfg.hparams.desired_batch_size
-    grad_accum_steps = 1  # max(4, desired_batch_size // (bsz * seqlen))
+    grad_accum_steps = max(1, desired_batch_size // (bsz * seqlen))
 
     b1 = cfg.hparams.b1
     b2 = cfg.hparams.b2
@@ -322,7 +325,10 @@ def main():
     # Checkpointing
     ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir)
     options = ocp.CheckpointManagerOptions(
-        max_to_keep=max_checkpoints_to_keep, save_interval_steps=checkpoint_save_steps
+        max_to_keep=max_checkpoints_to_keep,
+        save_interval_steps=checkpoint_save_steps,
+        enable_async_checkpointing=True,
+        enable_background_delete=True,
     )
     handlers = {
         "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
@@ -375,6 +381,7 @@ def main():
     num_shards_used = 0
     step = resume_from_step
     training_complete = False
+
     print("Starting training (the first step will take some time for compilation...)\n")
     train_start_time = time.time()
 
@@ -397,7 +404,10 @@ def main():
             bf.size = size
 
             shard_processed_fully = False
-            print(f"\n=== Processing Shard: {num_shards_used} with name: {shard_name} ====")  # fmt: off
+            num_batches_in_shard = bf.build(bsz, seqlen)
+            print(f"\n=== Processing Shard: {num_shards_used} with name: {shard_name}", end=" | ")  # fmt: off
+            print(f"Indexed {num_batches_in_shard} batches ===")
+
             while not shard_processed_fully:
                 try:
                     start = time.time()
@@ -438,15 +448,14 @@ def main():
                     tokens_processed = bsz * seqlen * grad_accum_steps
                     tokens_per_sec = int(tokens_processed / dt)
 
-                    if (step % options.save_interval_steps) == 0:
-                        mngr.save(
-                            step,
-                            args=ocp.args.Composite(
-                                params=ocp.args.PyTreeSave(model),
-                                optim_state=ocp.args.PyTreeSave(optim_state),
-                                ds=grain.checkpoint.CheckpointSave(train_iter),
-                            ),
-                        )
+                    mngr.save(
+                        step,
+                        args=ocp.args.Composite(
+                            params=ocp.args.PyTreeSave(model),
+                            optim_state=ocp.args.PyTreeSave(optim_state),
+                            ds=grain.checkpoint.CheckpointSave(train_iter),
+                        ),
+                    )
                     print(
                         f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {avg_train_loss:8.4f} | Time taken: {dt:8.2f} s | Tokens processed/s: {tokens_per_sec:>9,}"
                     )
@@ -480,6 +489,10 @@ def main():
                             bf = BOSFinder(tokens)
                             bf.bos_idx = bos_idx
                             bf.size = size
+                            # Build the index so that subsequent evaluations are
+                            # faster as won't be searching for start/end every time
+                            if not bf.built_ready:
+                                _ = bf.build(bsz, seqlen)
                             starts, ends = bf.next_batch(bsz, seqlen)
                             x, y = get_next_batch(
                                 starts, ends, bsz, seqlen, tokens, data_sharding
