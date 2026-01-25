@@ -10,6 +10,12 @@ def get_sharding_for_checkpoint(x, mesh):
     if hasattr(x, "ndim") and x.ndim == 0:
         return NamedSharding(mesh, P())
     if isinstance(x, jax.Array) and hasattr(x, "sharding"):
+        from jax.sharding import SingleDeviceSharding
+
+        # Ensure small optimizer leaves (e.g., Muon scalars/vectors) are replicated,
+        # not left on a single device, to match param shardings during train_step.
+        if isinstance(x.sharding, SingleDeviceSharding):
+            return NamedSharding(mesh, P())
         return x.sharding
     else:
         return NamedSharding(mesh, P())
