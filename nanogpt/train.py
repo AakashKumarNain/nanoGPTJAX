@@ -130,7 +130,7 @@ def build_optimizer(
         return out
 
     def label_fn(path, leaf):
-        # Top-level fields in your GPT pytree: embed, blocks, lm_head
+        # Top-level fields in GPT pytree: embed, blocks, lm_head
         names = _path_names(path)
         top = names[0] if names else ""
         if top == "embed":
@@ -310,7 +310,6 @@ def main():
         ),
     )
 
-    # No grad accum for now
     if grad_accum_steps > 1:
         print("Applying grad accum schedule to the optimizer...")
         optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
