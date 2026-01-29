@@ -141,19 +141,19 @@ to make the array contiguous as transpose is just a view in the end. It works no
 
 # Optimizations
 
-- Both adamw and muon works well. We achieve the same validation loss as achieved by `nanochat` and `modded-nanogpt`.
 - We still have not applied any tricks, yet the throughput, the optimization, and the model outputs all are in great shape.
 - I am not sure how important the document boundary is for pretraining. As of now, the grain processes takes 500MB on
 each GPU which is not good, and because of the process finding bos tokens and generating sequences on the fly, there
 are times when the GPU utilization becomes poor. Though it's not that bad, but I would love to get rid of any bubble in the data loading pipeline. 
 
 
-# Muon
+## Optimizer: AdamW and Muon
 
-Though it is straightforward to use muon in JAX (thanks to Optax!), but there are a few nuances that one needs to be aware of. Muon can be applied to any high
-rank array, but we need to make it aware of those dimensions, otherwise those leaves won't get muon benefits. For example, in our codebase the attention
-weights are 3D arrays as opposed to 2D. The reason we have kept them in 3D is because sharding becomes extremely easy. A side effect of this is that we need to
-make muon aware of this to ensure that arrays are rehsape properly for orthogonalization, otheriwse they are assumed to be 2D. Here is an example:
+- Both adamw and muon works well. We achieve the same validation loss as achieved by `nanochat` and `modded-nanogpt`.
+- Though it is straightforward to use muon in JAX (thanks to Optax!), but there are a few nuances that one needs to be aware of. Muon can be applied to any high rank array, but we need to make it aware of those dimensions, otherwise those leaves won't get muon benefits. For example, in our codebase the attention weights are 3D arrays as opposed to 2D. The reason we have kept them in 3D is because sharding becomes extremely easy. A side effect of this is that we need to
+make muon aware of this to ensure that arrays are rehsape properly for orthogonalization, otheriwse they are assumed to be 2D.
+
+Here is an example:
 
 ```python
 ef make_muon(lr_schedule, weight_decay=0.0):
@@ -198,7 +198,8 @@ ef make_muon(lr_schedule, weight_decay=0.0):
 ```
 
 Though the above implementation works perfectly and converges very quickly compared to `AdamW`, we take a big hit on the throughput. For example, if a single
-H100 instance was processing almost 400K tokens/second with `adamw`, switching to the above will reduce the throughput to 300-330K tokens/second. That's a big hit!
+H100 instance was processing almost 400K tokens/second with `adamw`, switching to the above will reduce the throughput to 300-330K tokens/second.
+That's a big hit!
 
 Why the drop, one may ask? The `Newton–Schulz orthogonalization` adds extra matmuls, and if you flatten across a sharded axis it also triggers extra cross‑device collectives. Both effects reduce tokens/s by roughly 5–15% in practice. An easy to get back close to the original throughput is to ensure Muon orthogonalize “locally” by treating the sharded head axis as a batch axis (so no collectives across heads). For example, `wq/wk/wv (d_emb, heads, head_dim): use reduction=(0,), output=(2,)` and leave heads as batch. Similarly, `wo (heads, head_dim, d_emb): use reduction=(1,), output=(2,)` and leave heads as batch. This still gives the intended 2D matrix per head, but avoids flattening across heads. Optax supports this directly via muon_weight_dimension_numbers. We can
 also bring down Newton–Schulz iterations to 3. 
