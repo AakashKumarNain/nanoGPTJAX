@@ -256,6 +256,8 @@ def make_muon(lr_schedule, weight_decay=0.0):
 We want to squeeze out of our GPUs as much as possible. Though after a certain point, DDP is not a very good strategy to use, we have to live with it for now.
 We will expand the model depth and width in the next version, and will improve a lot of key aspects listed here. 
 
+### 2.1 Data Pipeline
+
 - Our dataloader uses multithreading with prefetching. Earlier we used multiprocessing which may have provided better results, but for some reason grain
 multiprocess starts using GPU memory (around 512 MB/worker) when the worker count is greater than 1. I tried everything I could think of to avoid it, but it
 kept eating valuable GPU memory, hence switched to multithreading with prefetching.
@@ -264,3 +266,37 @@ kept eating valuable GPU memory, hence switched to multithreading with prefetchi
 We then transfer this entire buffer to the GPUs and then create inputs-targets pair. This is better than creating pairs first and then transferring the pairs
 to the GPUs as in that case we need to move two buffers to the HBM from the host.
 
+### 2.2 Gradient Accumulation
+
+- Though we tried to keep the GPU as busy as we can in the above steps, that pipeline has still some bubbles and we can squeeze those GPUs even more. The problem
+is that we cannot increase the per device batch size more than we already have as it will OOM. We can apply gradient accumulation to mirror an increased 
+effective batch size.
+- It is easy to use gradient accumulation in optax. We just need to apply `optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)`. There are no more
+changes needed, and rest of the training loop remain as is. 
+- Though the above works, it does not let you squeeze the GPU performance. There is a way to do that wehere you write one normal `train_step`, and another `train_accum_step`. Both are similar except that we do not update parameters in one of them. By doing so we avoid the no-op update and writing all the weights to HBM at each accumulation step. Ideally it should work, but I guess there is some bug in optax. We have opened an [issue](https://github.com/google-deepmind/optax/issues/1567#issuecomment-3795034778) regarding the same
+- For the time being, we have switched to custom gradient accumulation. 
+
+```python
+@partial(jax.jit, static_argnames=("optim", "grad_accum_steps"), donate_argnums=(0, 1, 4))
+def train_step_accum(params, x_batch, y_batch, freqs, optim_state, optim, grad_accum_steps):
+    # x_batch, y_batch: [grad_accum_steps, bsz, seqlen]
+    def body(carry, xy):
+        curr_param, grad_sum, loss_sum = carry
+        curr_x, curr_x = xy
+        (loss, _), curr_grad = jax.value_and_grad(compute_loss, has_aux=True)(curr_param, curr_x, curr_y, freqs)
+        grad_sum = jax.tree_util.tree_map(lambda a, b: a + b, grad_sum, curr_grad)
+        loss_sum = loss_sum + loss
+        return (curr_param, grad_sum, loss_sum), None
+
+    g0 = jax.tree_util.tree_map(jnp.zeros_like, params)
+    carry0 = (params, g0, jnp.array(0.0, dtype=jnp.result_type(0.0)))
+    (p, gsum, lsum), _ = jax.lax.scan(body, carry0, (x_batch, y_batch), length=grad_accum_steps)
+
+    steps = grad_accum_steps
+    gsum = jax.tree_util.tree_map(lambda g: g / steps, gsum)
+    loss = lsum / steps
+
+    updates, optim_state = optim.update(gsum, optim_state, p)
+    params = optax.apply_updates(p, updates)
+    return params, loss, optim_state
+```
