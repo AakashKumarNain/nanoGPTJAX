@@ -147,7 +147,7 @@ each GPU which is not good, and because of the process finding bos tokens and ge
 are times when the GPU utilization becomes poor. Though it's not that bad, but I would love to get rid of any bubble in the data loading pipeline. 
 
 
-## Optimizer: AdamW and Muon
+## 1. Optimizer: AdamW and Muon
 
 - Both adamw and muon works well. We achieve the same validation loss as achieved by `nanochat` and `modded-nanogpt`.
 - Though it is straightforward to use muon in JAX (thanks to Optax!), but there are a few nuances that one needs to be aware of. Muon can be applied to any high rank array, but we need to make it aware of those dimensions, otherwise those leaves won't get muon benefits. For example, in our codebase the attention weights are 3D arrays as opposed to 2D. The reason we have kept them in 3D is because sharding becomes extremely easy. A side effect of this is that we need to
@@ -250,3 +250,17 @@ def make_muon(lr_schedule, weight_decay=0.0):
         muon_weight_dimension_numbers=muon_dims_fn,
     )
 ```
+
+## 2. GPU Usage
+
+We want to squeeze out of our GPUs as much as possible. Though after a certain point, DDP is not a very good strategy to use, we have to live with it for now.
+We will expand the model depth and width in the next version, and will improve a lot of key aspects listed here. 
+
+- Our dataloader uses multithreading with prefetching. Earlier we used multiprocessing which may have provided better results, but for some reason grain
+multiprocess starts using GPU memory (around 512 MB/worker) when the worker count is greater than 1. I tried everything I could think of to avoid it, but it
+kept eating valuable GPU memory, hence switched to multithreading with prefetching.
+- Though we are prefetching, there can still be bubbles in the data pipeline and may lead to a poor GPU usage. To avoid that, we keep an extra buffer of `uin16`
+(as the original data is in in uint16) of size `(bsz, seqlen + 1)`, and we keep refilling it instead of creating a new buffer every time `next_batch` is called.
+We then transfer this entire buffer to the GPUs and then create inputs-targets pair. This is better than creating pairs first and then transferring the pairs
+to the GPUs as in that case we need to move two buffers to the HBM from the host.
+
