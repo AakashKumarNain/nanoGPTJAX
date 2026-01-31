@@ -79,26 +79,16 @@ def build_optimizer(
     warmup_steps: int = 30,
     b1: float = 0.9,
     b2: float = 0.95,
-    embedding_lr: float = 3e-3,
-    unembedding_lr: float = 3e-4,
+    embedding_lr: float = 0.2,
+    unembedding_lr: float = 0.004,
     use_muon=True,
 ):
-    """
-    Parameter groups:
-      - params.embed      -> AdamW with nanochat embedding LR (scaled by (d_model/768)^-0.5)
-      - params.lm_head    -> AdamW with nanochat unembedding LR (scaled by (d_model/768)^-0.5)
-      - everything else   -> AdamW with warmup+cosine schedule
-
-    Returns: (optax_transform, param_labels)
-    """
-
     # nanochat's width scaling for AdamW groups: (d_model / 768) ** -0.5
-    # dmodel_lr_scale = (d_model / 768.0) ** -0.5
+    dmodel_lr_scale = (d_model / 768.0) ** -0.5
 
-    # emb_lr = embedding_lr * dmodel_lr_scale
-    # unemb_lr = unembedding_lr * dmodel_lr_scale
-    emb_lr = embedding_lr * other_peak_lr
-    unemb_lr = 1.0 * other_peak_lr
+    # use width scaling for embed/lm_head; do not tie to other_peak_lr
+    emb_lr = embedding_lr * dmodel_lr_scale
+    unemb_lr = unembedding_lr * dmodel_lr_scale
 
     if use_muon:
         print("Using Muon Optimizer!")
@@ -160,9 +150,8 @@ def build_optimizer(
             if len(s) == 3:
                 if s[-1] == d_model:  # wo: (heads, head_dim, d_model)
                     return optax.contrib.MuonDimensionNumbers((1,), (2,))
-                return optax.contrib.MuonDimensionNumbers(
-                    (0,), (2,)
-                )  # wq/wk/wv: batch=heads
+                # wq/wk/wv: batch=heads
+                return optax.contrib.MuonDimensionNumbers((0,), (2,))
             return None
 
         return jax.tree_util.tree_map(choose, p)
@@ -177,11 +166,21 @@ def build_optimizer(
     muon_weight_dim_nums = make_weight_dim_nums(params)
     muon_wd_mask = weight_decay_mask_fn(params)
 
+    def make_adamw(lr_schedule, weight_decay=0.0):
+        return optax.adamw(
+            learning_rate=lr_schedule,
+            b1=b1,
+            b2=b2,
+            eps=1e-10,
+            weight_decay=weight_decay,
+            mu_dtype=jnp.float32,
+        )
+
     def make_muon(lr_schedule, weight_decay=0.0):
         return optax.contrib.muon(
             learning_rate=lr_schedule,
             ns_coeffs=(3.4445, -4.775, 2.0315),
-            ns_steps=3,
+            ns_steps=5,
             beta=b2,
             eps=1e-8,
             weight_decay=weight_decay,
@@ -197,13 +196,14 @@ def build_optimizer(
             consistent_rms=None,
         )
 
+    # no weight decay on Muon matrix params (common recipe)
     tx = optax.multi_transform(
         {
             "embed": make_adamw(schedules["embed"]),
             "lm_head": make_adamw(schedules["lm_head"]),
-            "other": make_muon(schedules["other"], weight_decay=0.001)
+            "other": make_muon(schedules["other"], weight_decay=0.0)
             if use_muon
-            else make_adamw(schedules["other"], weight_decay=0.001),
+            else make_adamw(schedules["other"], weight_decay=0.0),
         },
         param_labels,
     )
@@ -355,7 +355,9 @@ def main():
     resume_from_step = cfg.ckpt_cfg.last_checkpoint_step
 
     if resume_from_step > 0:
-        resume_ckpt_path = os.path.join(cfg.ckpt_cfg.save_ckpt_dir, str(resume_from_step))
+        resume_ckpt_path = os.path.join(
+            cfg.ckpt_cfg.save_ckpt_dir, str(resume_from_step)
+        )
         if os.path.exists(resume_ckpt_path):
             from checkpoint_utils import load_checkpoint
 
