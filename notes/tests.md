@@ -256,12 +256,15 @@ def make_muon(lr_schedule, weight_decay=0.0):
 We want to squeeze out of our GPUs as much as possible. Though after a certain point, DDP is not a very good strategy to use, we have to live with it for now.
 We will expand the model depth and width in the next version, and will improve a lot of key aspects listed here. 
 
+**Note:** Earlier it was noted that GPU flags may have not have that drastic performance difference, but turned out they are important, and have been added back.
+
+
 ### 2.1 Data Pipeline
 
 - Our dataloader uses multithreading with prefetching. Earlier we used multiprocessing which may have provided better results, but for some reason grain
 multiprocess starts using GPU memory (around 512 MB/worker) when the worker count is greater than 1. I tried everything I could think of to avoid it, but it
 kept eating valuable GPU memory, hence switched to multithreading with prefetching.
-- Though we are prefetching, there can still be bubbles in the data pipeline and may lead to a poor GPU usage. To avoid that, we keep an extra buffer of `uin16`
+- Though we are prefetching, there can still be bubbles in the data pipeline and may lead to a poor GPU usage. To avoid that, we keep an extra buffer of `uint16`
 (as the original data is in in uint16) of size `(bsz, seqlen + 1)`, and we keep refilling it instead of creating a new buffer every time `next_batch` is called.
 We then transfer this entire buffer to the GPUs and then create inputs-targets pair. This is better than creating pairs first and then transferring the pairs
 to the GPUs as in that case we need to move two buffers to the HBM from the host.
@@ -299,4 +302,42 @@ def train_step_accum(params, x_batch, y_batch, freqs, optim_state, optim, grad_a
     updates, optim_state = optim.update(gsum, optim_state, p)
     params = optax.apply_updates(p, updates)
     return params, loss, optim_state
+```
+
+
+# 3. Cautious Weight Decay
+
+Very cool idea from this [paper](https://arxiv.org/abs/2510.12402) The idea is simple yet very effective: **Apply weight decay only to parameter coordinates whose signs align with the optimizer update.** We can implement it very quickly by adding one more gradient transformation as shown below:
+
+```python
+def cautious_decay(schedule, wd):
+        def init_fn(params):
+            return {"count": jnp.array(0, dtype=jnp.int32)}
+
+        def update_fn(updates, state, params=None):
+            step = state["count"]
+            scale = schedule(step)
+            if params is None:
+                return updates, {"count": step + 1}
+
+            def apply_updates(update, param):
+                if param is None:
+                    return update
+                s = getattr(param, "shape", None)
+                eligible_for_update = (s is not None) and (len(s) >= 2)
+                if not eligible_for_update:
+                    return update
+                # Cautious: only decay when update and param are aligned (same sign)
+                decay = jnp.where(
+                    (update * param) >= 0,
+                    param.astype(update.dtype),
+                    jnp.zeros_like(update),
+                )
+                # Subtract to apply weight decay (moves parameters toward zero)
+                return update - (scale * wd) * decay
+
+            new_updates = jax.tree_util.tree_map(apply_updates, updates, params)
+            return new_updates, {"count": step + 1}
+
+        return optax.GradientTransformation(init_fn, update_fn)
 ```
