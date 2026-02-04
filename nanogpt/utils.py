@@ -105,15 +105,15 @@ def layer_repr(obj, max_width: int = 80, _indent: int = 0) -> str:
 
 def _initialize_parameter_leaves(key, specs, shardings):
     # specs and shardings are already flattened tuples
-    keys = jax.random.split(key, len(specs))
+    # keys = jax.random.split(key, len(specs))
 
     # Init one leaf at a time instead of a big jitted graph. The compile time would go crazy.
     # There may be some gotchas here, but I am not noticing anything weird for now. Keep an eye on it!
     # def init_one(k, spec, sharding):
     #     return jax.jit(spec.initializer, out_shardings=sharding, static_argnums=(1, 2))(k, spec.shape, spec.dtype)
-        
+
     # return tuple(init_one(k, s, sh) for k, s, sh in zip(keys, specs, shardings))
-    
+
     @partial(jax.jit, out_shardings=shardings)
     def _init_fn(key: jax.random.PRNGKey):
         num_leaves = len(jax.tree.leaves(specs, is_leaf=is_param_spec))

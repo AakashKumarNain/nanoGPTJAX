@@ -134,13 +134,11 @@ def sample_from_model(
         prompts, allowed_special={"<|endoftext|>", "<|pad|>"}
     )
     input_ids, segment_ids = pad_tokens(
-        encoded,
-        pad_id=pad_id,
-        pad_to_power_of_two=pad_to_power_of_two
+        encoded, pad_id=pad_id, pad_to_power_of_two=pad_to_power_of_two
     )
 
     # cache_key, decode_key = jax.random.split(key)
-    
+
     # In case you want to reproduce the outputs shown in the Readme,
     # you can use these keys for cache and decoding
 

@@ -113,7 +113,7 @@ import grain
 import numpy as np
 from pathlib import Path
 from grain.multiprocessing import SharedMemoryArray
-from grain.experimental import ThreadPrefetchIterDataset
+# from grain.experimental import ThreadPrefetchIterDataset
 
 
 BOS_ID = 50256
@@ -297,9 +297,9 @@ def make_grain_shard_loader(files):
     # Auto-tune
     performance_config = grain.experimental.pick_performance_config(
         ds=ds,
-        ram_budget_mb=1024 * 10, # Depending on your RAM size
+        ram_budget_mb=1024 * 10,  # Depending on your RAM size
         max_workers=None,
-        max_buffer_size=None
+        max_buffer_size=None,
     )
     ds = ds.to_iter_dataset(read_options=performance_config.read_options)
     return ds
