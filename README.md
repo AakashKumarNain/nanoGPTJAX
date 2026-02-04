@@ -31,8 +31,8 @@ The models here can be trained with both `AdamW` and `Muon` optimizers (via Opta
 - [x] Minimal abstraction for defining layers and models
 - [x] Pretrain a GPT-2-like model on FineWeb 10B tokens
 - [x] Inference
+- [x] Cautious Weight Decay
 - [ ] Speculative Decoding
-- [ ] Add tricks from [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo to push the convergence
 - [ ] Leaderboard to track run time for convergence wrt tricks
 - [ ] Supervised fine-tuning on a dataset
 - [ ] Reinforcement learning on a dataset
