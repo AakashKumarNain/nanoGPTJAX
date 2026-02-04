@@ -266,13 +266,16 @@ class HyperParams:
 
     # Optimizer related
     max_lr: float = 6e-4
-    min_lr: float = 0.0
-    warmup_steps: int = 50
-    b1: float = 0.9
+    min_lr: float = 6e-5
+    embedding_lr: float = 0.2
+    unembedding_lr: float = 0.004
+    b1: float = 0.8
     b2: float = 0.95
     weight_decay: float = 0.0
+    cautious_weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
-    total_train_steps: int = 5000
+    total_train_steps: int = 10000
+    warmup_steps: int = min(300, 0.01 * total_train_steps)  # ~10% of total steps
 
     # Other
     es_patience: int = 500
