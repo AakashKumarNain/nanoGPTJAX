@@ -69,6 +69,7 @@ ignore = []
 # Ignore `E402` (import violations) in all `__init__.py` files, and in selected subdirectories.
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402"]
+"**/nanogpt/*" = ["E402"]
 "**/{tests,docs,tools}/*" = ["E402"]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
