@@ -1,4 +1,5 @@
 import dataclasses
+from functools import partial
 from typing import Callable, Tuple
 
 import jax
@@ -107,13 +108,26 @@ def _initialize_parameter_leaves(key, specs, shardings):
     keys = jax.random.split(key, len(specs))
 
     # Init one leaf at a time instead of a big jitted graph. The compile time would go crazy.
-    # TODO: There may be some gotchas here, but I am not noticing anything weird for now. Keep an eye on it!
-    def init_one(k, spec, sharding):
-        return jax.jit(spec.initializer, out_shardings=sharding, static_argnums=(1, 2))(
-            k, spec.shape, spec.dtype
+    # There may be some gotchas here, but I am not noticing anything weird for now. Keep an eye on it!
+    # def init_one(k, spec, sharding):
+    #     return jax.jit(spec.initializer, out_shardings=sharding, static_argnums=(1, 2))(k, spec.shape, spec.dtype)
+        
+    # return tuple(init_one(k, s, sh) for k, s, sh in zip(keys, specs, shardings))
+    
+    @partial(jax.jit, out_shardings=shardings)
+    def _init_fn(key: jax.random.PRNGKey):
+        num_leaves = len(jax.tree.leaves(specs, is_leaf=is_param_spec))
+        key_iter = iter(jax.random.split(key, num_leaves))
+
+        # Map over the specifications, calling the initializer for each one
+        # with a different rng key
+        return jax.tree.map(
+            lambda spec: spec.initializer(next(key_iter), spec.shape, spec.dtype),
+            specs,
+            is_leaf=is_param_spec,
         )
 
-    return tuple(init_one(k, s, sh) for k, s, sh in zip(keys, specs, shardings))
+    return _init_fn(key)
 
 
 @dataclasses.dataclass(frozen=True)
