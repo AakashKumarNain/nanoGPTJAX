@@ -24,7 +24,6 @@ We follow the standard Transformer architecture, with the following choices:
 
 The models here can be trained with both `AdamW` and `Muon` optimizers (via Optax). You can use any sharding strategy depending on the size of the model. We use the cached, tokenized **FineWeb10B** dataset as in [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).
 
-**Note:** Only the dataloader was written with the help of code agents. It is not optimal, and I plan to replace it with my own implementation. <br>
 
 ## Tasks
 
