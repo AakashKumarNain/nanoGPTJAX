@@ -292,17 +292,14 @@ class LoadShardTokens(grain.transforms.Map):
 #     )
 
 
-def make_grain_shard_loader(
-    files, prefetch=2, num_threads=16, prefetch_buffer_size=256
-):
-    read_opts = grain.ReadOptions(
-        num_threads=num_threads, prefetch_buffer_size=prefetch_buffer_size
+def make_grain_shard_loader(files):
+    ds = grain.MapDataset.source([str(p) for p in files]).map(LoadShardTokens())
+    # Auto-tune
+    performance_config = grain.experimental.pick_performance_config(
+        ds=ds,
+        ram_budget_mb=1024 * 10, # Depending on your RAM size
+        max_workers=None,
+        max_buffer_size=None
     )
-    ds = (
-        grain.MapDataset.source([str(p) for p in files])
-        .map(LoadShardTokens())
-        .to_iter_dataset(read_options=read_opts)
-    )
-    if prefetch > 0:
-        ds = ThreadPrefetchIterDataset(ds, prefetch_buffer_size=prefetch)
+    ds = ds.to_iter_dataset(read_options=performance_config.read_options)
     return ds
