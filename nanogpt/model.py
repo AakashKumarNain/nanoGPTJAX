@@ -148,9 +148,8 @@ def mlp_forward(params, x):
 #################################### For training ########################################
 
 
-def attn_forward(params, x, freqs):
+def attn_forward(params, x, mask, freqs):
     orig_dtype = x.dtype
-    bsz, seqlen, _ = x.shape
     sin, cos = freqs
 
     with jax.named_scope("qkv_matmul"):
@@ -166,45 +165,68 @@ def attn_forward(params, x, freqs):
         q = calculate_rope(q, sin, cos)
         k = calculate_rope(k, sin, cos)
 
-    # output shape: (bsz, seqlen, q_heads, head_dim)
     with jax.named_scope("attention"):
-        scale = None  # 1.0 / math.sqrt(q.shape[-1])
-        attn = jax.nn.dot_product_attention(
-            q, k, v, is_causal=True, implementation=ATTN_IMPL, scale=scale
-        ).astype(orig_dtype)
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        if mask is not None:
+            attn = jax.nn.dot_product_attention(
+                q,
+                k,
+                v,
+                mask=mask,
+                scale=scale,
+                is_causal=True,
+                implementation=ATTN_IMPL,
+            ).astype(orig_dtype)
+        else:
+            attn = jax.nn.dot_product_attention(
+                q, k, v, scale=scale, is_causal=True, implementation=ATTN_IMPL
+            ).astype(orig_dtype)
 
-    # params.wo is of shape (q_heads, head_dim, d_emb)
     with jax.named_scope("projection"):
         out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
     return out
 
 
-def block_forward(params, x, freqs):
-    # Attention
+def block_forward(params, x, mask, freqs):
     with jax.named_scope("pre_attn_norm"):
         attn_in = rmsnorm_forward(x)
 
-    attn_out = attn_forward(params.attn, attn_in, freqs)
+    attn_out = attn_forward(params.attn, attn_in, mask, freqs)
 
     with jax.named_scope("residual"):
         x = x + attn_out
 
-    # FFN
     with jax.named_scope("post_attn_norm"):
         ffn_in = rmsnorm_forward(x)
+
     with jax.named_scope("ffn"):
         ffn_out = mlp_forward(params.mlp, ffn_in)
+
     with jax.named_scope("residual"):
         x = x + ffn_out
     return x
 
 
-def forward(params, x, freqs):
+def compute_segment_mask(segment_ids):
+    """Compute once, reuse across all layers. Returns (B, 1, T, S) bias or None."""
+    if segment_ids is None:
+        return None
+    same_segment = jnp.equal(segment_ids[:, :, None], segment_ids[:, None, :])
+    return same_segment[:, None, :, :]
+
+
+def forward(params, x, segment_ids, freqs):
+    if segment_ids is not None:
+        with jax.named_scope("compute_mask"):
+            mask = compute_segment_mask(segment_ids)
+    else:
+        mask = None
+
     with jax.named_scope("embedding"):
         x = embedding_forward(params.embed, x)
 
     for block in params.blocks:
-        x = block_forward(block, x, freqs)
+        x = block_forward(block, x, mask, freqs)
 
     with jax.named_scope("norm"):
         x = rmsnorm_forward(x)
