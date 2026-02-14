@@ -54,18 +54,18 @@ logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
 
 # Enable activation checkpointing
-# policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-# forward_remat = jax.checkpoint(forward, policy=policy)
+policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+forward_remat = jax.checkpoint(forward, policy=policy)
 
 
 def compute_loss(params, x_batch, y_batch, segment_ids, freqs):
-    logits = forward(params, x_batch, segment_ids, freqs)
+    logits = forward_remat(params, x_batch, segment_ids, freqs)
     loss = jnp.mean(
         optax.losses.softmax_cross_entropy_with_integer_labels(
             logits=logits, labels=y_batch
         )
     )
-    return loss, logits
+    return loss
 
 
 @partial(
@@ -78,9 +78,7 @@ def train_step_accum(
     def body(carry, xy):
         p, gsum, lsum = carry
         xb, yb = xy
-        (loss, _), g = jax.value_and_grad(compute_loss, has_aux=True)(
-            p, xb, yb, segment_ids, freqs
-        )
+        loss, g = jax.value_and_grad(compute_loss)(p, xb, yb, segment_ids, freqs)
         gsum = jax.tree_util.tree_map(lambda a, b: a + b, gsum, g)
         lsum = lsum + loss
         return (p, gsum, lsum), None
@@ -102,7 +100,7 @@ def train_step_accum(
 
 @partial(jax.jit, static_argnames=("optim",), donate_argnums=(0, 4))
 def train_step(params, x_batch, y_batch, segment_ids, freqs, optim_state, optim):
-    (loss, logits), grads = jax.value_and_grad(compute_loss, has_aux=True)(
+    loss, grads = jax.value_and_grad(compute_loss)(
         params, x_batch, y_batch, segment_ids, freqs
     )
     updates, optim_state = optim.update(grads, optim_state, params)
@@ -112,7 +110,7 @@ def train_step(params, x_batch, y_batch, segment_ids, freqs, optim_state, optim)
 
 @jax.jit
 def val_step(params, x_batch, y_batch, segment_ids, freqs):
-    loss, _ = compute_loss(params, x_batch, y_batch, segment_ids, freqs)
+    loss = compute_loss(params, x_batch, y_batch, segment_ids, freqs)
     return loss
 
 
