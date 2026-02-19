@@ -1,3 +1,5 @@
+# KVCache
+
 The new kvcache implementation for forward pass where prompts are left-padded, and generated sequences are right-aligned works well without jit. JIT also
 works but with `cudnn` attention implementation right now, it's throwing some error that corresponds to some layout issues. It works well with other `xla` or `None`, but after a point the output diverges from the actual output obtained with `cudnn`. This issue has already been raised with the JAX team.
 
@@ -139,7 +141,7 @@ to make the array contiguous as transpose is just a view in the end. It works no
 
 ---
 
-# Optimizations
+# 2. Optimizations
 
 - We still have not applied any tricks, yet the throughput, the optimization, and the model outputs all are in great shape.
 - I am not sure how important the document boundary is for pretraining. As of now, the grain processes takes 500MB on
@@ -147,7 +149,7 @@ each GPU which is not good, and because of the process finding bos tokens and ge
 are times when the GPU utilization becomes poor. Though it's not that bad, but I would love to get rid of any bubble in the data loading pipeline. 
 
 
-## 1. Optimizer: AdamW and Muon
+## 2.1 Optimizer: AdamW and Muon
 
 - Both adamw and muon works well. We achieve the same validation loss as achieved by `nanochat` and `modded-nanogpt`.
 - Though it is straightforward to use muon in JAX (thanks to Optax!), but there are a few nuances that one needs to be aware of. Muon can be applied to any high rank array, but we need to make it aware of those dimensions, otherwise those leaves won't get muon benefits. For example, in our codebase the attention weights are 3D arrays as opposed to 2D. The reason we have kept them in 3D is because sharding becomes extremely easy. A side effect of this is that we need to
@@ -251,7 +253,7 @@ def make_muon(lr_schedule, weight_decay=0.0):
     )
 ```
 
-## 2. GPU Usage
+## 2.2 GPU Usage
 
 We want to squeeze out of our GPUs as much as possible. Though after a certain point, DDP is not a very good strategy to use, we have to live with it for now.
 We will expand the model depth and width in the next version, and will improve a lot of key aspects listed here. 
@@ -259,7 +261,7 @@ We will expand the model depth and width in the next version, and will improve a
 **Note:** Earlier it was noted that GPU flags may have not have that drastic performance difference, but turned out they are important, and have been added back.
 
 
-### 2.1 Data Pipeline
+### 2.2.1 Data Pipeline
 
 - Our dataloader uses multithreading with prefetching. Earlier we used multiprocessing which may have provided better results, but for some reason grain
 multiprocess starts using GPU memory (around 512 MB/worker) when the worker count is greater than 1. I tried everything I could think of to avoid it, but it
@@ -269,7 +271,7 @@ kept eating valuable GPU memory, hence switched to multithreading with prefetchi
 We then transfer this entire buffer to the GPUs and then create inputs-targets pair. This is better than creating pairs first and then transferring the pairs
 to the GPUs as in that case we need to move two buffers to the HBM from the host.
 
-### 2.2 Gradient Accumulation
+### 2.2.2 Gradient Accumulation
 
 - Though we tried to keep the GPU as busy as we can in the above steps, that pipeline has still some bubbles and we can squeeze those GPUs even more. The problem
 is that we cannot increase the per device batch size more than we already have as it will OOM. We can apply gradient accumulation to mirror an increased 
@@ -305,7 +307,7 @@ def train_step_accum(params, x_batch, y_batch, freqs, optim_state, optim, grad_a
 ```
 
 
-# 3. Cautious Weight Decay
+# 2.3 Cautious Weight Decay
 
 Very cool idea from this [paper](https://arxiv.org/abs/2510.12402) The idea is simple yet very effective: **Apply weight decay only to parameter coordinates whose signs align with the optimizer update.** We can implement it very quickly by adding one more gradient transformation as shown below:
 
@@ -341,3 +343,6 @@ def cautious_decay(schedule, wd):
 
         return optax.GradientTransformation(init_fn, update_fn)
 ```
+
+---
+
