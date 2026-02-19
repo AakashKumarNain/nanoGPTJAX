@@ -141,7 +141,7 @@ to make the array contiguous as transpose is just a view in the end. It works no
 
 ---
 
-# 2. Optimizations
+# Optimizations
 
 - We still have not applied any tricks, yet the throughput, the optimization, and the model outputs all are in great shape.
 - I am not sure how important the document boundary is for pretraining. As of now, the grain processes takes 500MB on
@@ -149,7 +149,7 @@ each GPU which is not good, and because of the process finding bos tokens and ge
 are times when the GPU utilization becomes poor. Though it's not that bad, but I would love to get rid of any bubble in the data loading pipeline. 
 
 
-## 2.1 Optimizer: AdamW and Muon
+## 1 Optimizer: AdamW and Muon
 
 - Both adamw and muon works well. We achieve the same validation loss as achieved by `nanochat` and `modded-nanogpt`.
 - Though it is straightforward to use muon in JAX (thanks to Optax!), but there are a few nuances that one needs to be aware of. Muon can be applied to any high rank array, but we need to make it aware of those dimensions, otherwise those leaves won't get muon benefits. For example, in our codebase the attention weights are 3D arrays as opposed to 2D. The reason we have kept them in 3D is because sharding becomes extremely easy. A side effect of this is that we need to
@@ -253,7 +253,7 @@ def make_muon(lr_schedule, weight_decay=0.0):
     )
 ```
 
-## 2.2 GPU Usage
+## 2 GPU Usage
 
 We want to squeeze out of our GPUs as much as possible. Though after a certain point, DDP is not a very good strategy to use, we have to live with it for now.
 We will expand the model depth and width in the next version, and will improve a lot of key aspects listed here. 
@@ -261,7 +261,7 @@ We will expand the model depth and width in the next version, and will improve a
 **Note:** Earlier it was noted that GPU flags may have not have that drastic performance difference, but turned out they are important, and have been added back.
 
 
-### 2.2.1 Data Pipeline
+### 2.1 Data Pipeline
 
 - Our dataloader uses multithreading with prefetching. Earlier we used multiprocessing which may have provided better results, but for some reason grain
 multiprocess starts using GPU memory (around 512 MB/worker) when the worker count is greater than 1. I tried everything I could think of to avoid it, but it
@@ -271,7 +271,7 @@ kept eating valuable GPU memory, hence switched to multithreading with prefetchi
 We then transfer this entire buffer to the GPUs and then create inputs-targets pair. This is better than creating pairs first and then transferring the pairs
 to the GPUs as in that case we need to move two buffers to the HBM from the host.
 
-### 2.2.2 Gradient Accumulation
+### 2.2 Gradient Accumulation
 
 - Though we tried to keep the GPU as busy as we can in the above steps, that pipeline has still some bubbles and we can squeeze those GPUs even more. The problem
 is that we cannot increase the per device batch size more than we already have as it will OOM. We can apply gradient accumulation to mirror an increased 
@@ -307,7 +307,7 @@ def train_step_accum(params, x_batch, y_batch, freqs, optim_state, optim, grad_a
 ```
 
 
-# 2.3 Cautious Weight Decay
+# 3. Cautious Weight Decay
 
 Very cool idea from this [paper](https://arxiv.org/abs/2510.12402) The idea is simple yet very effective: **Apply weight decay only to parameter coordinates whose signs align with the optimizer update.** We can implement it very quickly by adding one more gradient transformation as shown below:
 
@@ -345,4 +345,85 @@ def cautious_decay(schedule, wd):
 ```
 
 ---
+
+# SFT
+
+When doing mid-training or SFT, we need to do a few changes. Though we should train the model on a decent mix of datasets as used in `nanochat`, here I trained the model only one of the datasets for the sake of demonstration. We will train the model on all dataset, but the size of the current model (160M) is too small for that many number of tokens. We need to scale the model size first before doing that. I just want to ensure each and every component of every pipeline (Pretrain -> Mid-train -> Post-train) is working as expected before I start scaling the datset and the model sizes.
+
+## 1. CE loss with prompt masking
+
+Because most of the dataset used in mid-training/SFT will consists of role-based conversations (system, user, tool-call), we need to have the ability to train the model only on completions. Though the decison of "to mask or to not" heavily depends on the dataset size and the completion length, once we start scaling,
+masking non-completion tokens during training makes more sense.
+
+```python
+def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
+    """Corss-entropy loss with masked tokens"""
+    logits = forward(params, x_batch, segment_ids, freqs)
+    if loss_mask is not None:
+        per_token_loss = optax.losses.softmax_cross_entropy_with_integer_labels(
+            logits=logits,
+            labels=y_batch,
+            where=loss_mask,
+        )
+        return jnp.sum(per_token_loss) / jnp.maximum(jnp.sum(loss_mask), 1.0)
+    else:
+        return jnp.mean(
+            optax.losses.softmax_cross_entropy_with_integer_labels(
+                logits=logits, labels=y_batch
+            )
+        )
+```
+
+
+## 2. Dataloader - DO NOT WASTE TOKENS
+
+Preparing pretraining dataset is easy. You append the BOS token, ensure all sequences have sufficient length, and that's it. With SFT, things start to
+complicate a bit on the data loader side. If our sequence length or context window length is 2048, there is a high chance that a big fraction of the SFT
+data used to train the models won't have that many tokens. We have two choices there:
+
+- Pad the sequences to max sequence length (utter waste of compute!)
+- Do sequence packing but with a very good algorithm (Concat then split in our case!)
+
+When we do seuqnece packing, we also need information on which tokens belong to which sample in the sequence. This is where `segment_ids` comes handy. But wait,
+why is that information necessary? What can go wrong if you do not have segment information? Well, if you do not have the segment information, your positional
+information about the tokens will be a sequence of 2048 positions. The entire RoPE calculation will be wrong. This is why we need to compute the
+frequencies on the fly as opposed to static calculation during pretraining.
+
+Also, we would tokenize and save the sequence rather than doing tokenization on fly as it will be extremely skow
+
+```python
+source = ParquetTokenSource(shard_paths)
+
+ds = grain.MapDataset.source(source)
+if repeat:
+    ds = ds.shuffle(1234).repeat()
+
+total_batch_size = grad_accum_steps * batch_size if grad_accum_steps > 1 else batch_size
+
+ds = grain.experimental.ConcatThenSplitIterDataset(
+    parent=ds,
+    length_struct={"input_ids": sequence_length},
+    split_full_length_features=True,
+    bos_handling=grain.experimental.BOSHandling.REPLACE_FIRST_TOKEN_WITH_BOS,
+    bos_features=("input_ids",),
+    bos_token_id=meta["bos_token_id"],
+).batch(total_batch_size, drop_remainder=True)
+
+# Recover completion_mask from sign bit
+ds = ds.map(decode_mask_from_ids)
+
+# Grain gives the ability to load sharded tokens
+if grad_accum_steps > 1:
+    ds = ds.map(partial(prepare_train_accum_batch, grad_accum_steps=grad_accum_steps))
+else:
+    ds = ds.map(prepare_train_batch)
+
+if data_sharding is not None:
+    ds = grain.experimental.device_put(
+        ds,
+        device=data_sharding,
+        cpu_buffer_size=cpu_buffer_size,
+        device_buffer_size=device_buffer_size,
+    )
+```
 
