@@ -1,7 +1,7 @@
 """This dataloader is specifically build for mid-training/SFT stages. Here are a
 few noticeable things about this:
 
-- 
+-
 """
 
 import os
@@ -19,7 +19,6 @@ from tqdm import tqdm
 from functools import partial
 from datasets import load_dataset
 from array_record.python import array_record_module
-
 
 
 def prepare_train_batch(batch):
@@ -77,10 +76,14 @@ def build_tokenizer():
     pad_token = "<|pad|>"
 
     custom_tokens = [
-        user_start, user_end,
-        assistant_start, assistant_end,
-        system_start, system_end,
-        tool_start, tool_end,
+        user_start,
+        user_end,
+        assistant_start,
+        assistant_end,
+        system_start,
+        system_end,
+        tool_start,
+        tool_end,
         pad_token,
     ]
 
@@ -118,7 +121,6 @@ def build_tokenizer():
     }
 
 
-
 def encode_mask_into_ids(input_ids, completion_mask):
     """Fuse a boolean completion_mask into the sign of input_ids."""
     return np.where(completion_mask, input_ids, -(input_ids + 1)).astype(np.int32)
@@ -133,12 +135,11 @@ def decode_mask_from_ids(batch):
     return batch
 
 
-
 ROLE_MAP = {
-    "system":    ("system_start",    "system_end"),
-    "user":      ("user_start",      "user_end"),
+    "system": ("system_start", "system_end"),
+    "user": ("user_start", "user_end"),
     "assistant": ("assistant_start", "assistant_end"),
-    "tool":      ("tool_start",      "tool_end"),
+    "tool": ("tool_start", "tool_end"),
 }
 
 
@@ -172,7 +173,7 @@ def tokenize(example, tok_info):
     """Tokenize text and bake the completion mask into the sign bit."""
     tokenizer = tok_info["tokenizer"]
     tokens = np.array(
-        tokenizer.encode(example["text"],allowed_special="all"),
+        tokenizer.encode(example["text"], allowed_special="all"),
         dtype=np.int32,
     )
 
@@ -197,16 +198,16 @@ def tokenize(example, tok_info):
 
 
 # We will save the parquet files in this format
-PARQUET_SCHEMA = pa.schema([("input_ids", pa.list_(pa.int32())),])
+PARQUET_SCHEMA = pa.schema(
+    [
+        ("input_ids", pa.list_(pa.int32())),
+    ]
+)
 
 
 def save_tokenized(
-        dataset_path,
-        data_dir,
-        tok_info,
-        split,
-        records_per_shard, subset="openhermes-100k"
-    ):
+    dataset_path, data_dir, tok_info, split, records_per_shard, subset="openhermes-100k"
+):
     """Stream-download, tokenize, sign-encode, and write Parquet shards."""
 
     if not os.path.exists(data_dir):
@@ -283,11 +284,13 @@ def save_tokenized(
 # Grain loader helpers
 # ---------------------------------------------------------------------------
 
+
 def get_shard_paths(data_dir, split="train"):
     """Return sorted list of Parquet shard paths for the given split."""
     paths = sorted(Path(data_dir).glob(f"*{split}*.parquet"))
     print(f"Number of files found: ", len(paths))
     return [str(p) for p in paths]
+
 
 def load_meta(data_dir, split="train"):
     for fname in os.listdir(data_dir):
@@ -343,7 +346,9 @@ def make_grain_shard_loader(
     if repeat:
         ds = ds.shuffle(1234).repeat()
 
-    total_batch_size = grad_accum_steps * batch_size if grad_accum_steps > 1 else batch_size
+    total_batch_size = (
+        grad_accum_steps * batch_size if grad_accum_steps > 1 else batch_size
+    )
 
     ds = grain.experimental.ConcatThenSplitIterDataset(
         parent=ds,
@@ -358,7 +363,9 @@ def make_grain_shard_loader(
     ds = ds.map(decode_mask_from_ids)
 
     if grad_accum_steps > 1:
-        ds = ds.map(partial(prepare_train_accum_batch, grad_accum_steps=grad_accum_steps))
+        ds = ds.map(
+            partial(prepare_train_accum_batch, grad_accum_steps=grad_accum_steps)
+        )
     else:
         ds = ds.map(prepare_train_batch)
 
@@ -381,18 +388,30 @@ def main(args):
 
     save_tokenized(
         args.dataset_path,
-        args.save_data_dir, 
+        args.save_data_dir,
         tok_info,
         split=args.split,
-        records_per_shard=args.records_per_shard
+        records_per_shard=args.records_per_shard,
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Argument Parser for Mid-training")
-    parser.add_argument("--dataset_path", help="Name of the dataset (on HF)", required=True)
-    parser.add_argument("--save_data_dir", help="Directory to save the tokenized records", required=True, default="/home/ubuntu/nanochat/jaxnano/sft_data/")
-    parser.add_argument("--records_per_shard", help="Number of records to write per shard", default=10_0000, type=int)
+    parser.add_argument(
+        "--dataset_path", help="Name of the dataset (on HF)", required=True
+    )
+    parser.add_argument(
+        "--save_data_dir",
+        help="Directory to save the tokenized records",
+        required=True,
+        default="/home/ubuntu/nanochat/jaxnano/sft_data/",
+    )
+    parser.add_argument(
+        "--records_per_shard",
+        help="Number of records to write per shard",
+        default=10_0000,
+        type=int,
+    )
     parser.add_argument("--split", help="Data split to download", required=True)
     args = parser.parse_args()
     main(args)
