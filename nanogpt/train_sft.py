@@ -99,29 +99,22 @@ def train_step(
     return updated_params, loss, optim_state
 
 
+# fmt: off
 @partial(
     jax.jit,
     static_argnames=("optim", "grad_accum_steps", "head_dim"),
-    donate_argnums=(
-        0,
-        1,
-        3,
-        4,
-        5,
-    ),
+    donate_argnums=(0, 1, 3, 4, 5,),
 )
 def train_step_accum(
     params,
-    x_batch,
-    y_batch,
-    segment_ids,
-    positions,
-    optim_state,
-    optim,
+    x_batch, y_batch,  
+    segment_ids, positions,  
+    optim_state, optim,
     head_dim,
     prompt_mask,
     grad_accum_steps,
 ):
+# fmt: on
     freqs = jax.vmap(jitted_precompute_frequencies, in_axes=(0, None))(
         positions, head_dim
     )
@@ -407,17 +400,15 @@ def main():
                 else:
                     es_patience_counter += 1
 
+                 # fmt: off
                 if es_patience_counter > es_patience:
-                    print(
-                        f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps."
-                    )
+                    print(f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps.")
                     print(f"Total number of shards consumed : {num_shards_used}")
-                    print(
-                        f"Best loss                       : {best_loss:.4f} at step {best_step}"
-                    )
+                    print(f"Best loss                       : {best_loss:.4f} at step {best_step}")
                     mngr.wait_until_finished()
                     training_complete = True
                     break
+                 # fmt: on
 
                 print(f"last_val_loss : {last_val_loss:.4f}")
                 print(f"curr_val_loss : {avg_val_loss:.4f}")
