@@ -31,8 +31,8 @@ The models here can be trained with both `AdamW` and `Muon` optimizers (via Opta
 - [x] Pretrain a GPT-2-like model on FineWeb 10B tokens
 - [x] Inference
 - [x] Cautious Weight Decay
-- [ ] Mid-training
-- [ ] Supervised fine-tuning on a dataset
+- [x] Mid-training
+- [x] Supervised fine-tuning on a dataset
 - [ ] Reinforcement learning on a dataset
 - [ ] Speculative Decoding
 - [ ] Leaderboard to track run time for convergence wrt tricks
