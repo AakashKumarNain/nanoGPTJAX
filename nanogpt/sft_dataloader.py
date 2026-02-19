@@ -18,7 +18,6 @@ from pathlib import Path
 from tqdm import tqdm
 from functools import partial
 from datasets import load_dataset
-from array_record.python import array_record_module
 
 
 def prepare_train_batch(batch):
