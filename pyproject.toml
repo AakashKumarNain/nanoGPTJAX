@@ -15,6 +15,7 @@ dependencies = [
     "datasets==4.4.1",
     "ruff>=0.14.10",
     "rich>=14.2.0",
+    "tqdm"
 ]
 
 [project.optional-dependencies]
