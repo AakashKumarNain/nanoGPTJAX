@@ -68,33 +68,24 @@ def compute_loss(params, x_batch, y_batch, segment_ids, freqs):
     return loss
 
 
-@partial(
-    jax.jit, static_argnames=("optim", "grad_accum_steps"), donate_argnums=(0, 1, 4)
-)
+@partial(jax.jit, static_argnames=("optim", "grad_accum_steps"), donate_argnums=(0, 1, 4, 5))  # fmt: off
 def train_step_accum(
     params, x_batch, y_batch, segment_ids, freqs, optim_state, optim, grad_accum_steps
 ):
     # x_batch, y_batch: [grad_accum_steps, bsz, seqlen]
-    def body(carry, xy):
-        p, gsum, lsum = carry
+    def accum_body(carry, xy):
+        p, opt_state, lsum = carry
         xb, yb = xy
         loss, g = jax.value_and_grad(compute_loss)(p, xb, yb, segment_ids, freqs)
-        gsum = jax.tree_util.tree_map(lambda a, b: a + b, gsum, g)
-        lsum = lsum + loss
-        return (p, gsum, lsum), None
+        updates, new_opt_state = optim.update(g, opt_state, p)
+        new_p = optax.apply_updates(p, updates)
+        return (new_p, new_opt_state, lsum + loss), None
 
-    g0 = jax.tree_util.tree_map(jnp.zeros_like, params)
-    carry0 = (params, g0, jnp.array(0.0, dtype=jnp.result_type(0.0)))
-    (p, gsum, lsum), _ = jax.lax.scan(
-        body, carry0, (x_batch, y_batch), length=grad_accum_steps
+    carry0 = (params, optim_state, jnp.array(0.0, dtype=jnp.result_type(0.0)))
+    (params, optim_state, lsum), _ = jax.lax.scan(
+        accum_body, carry0, (x_batch, y_batch), length=grad_accum_steps
     )
-
-    steps = grad_accum_steps
-    gsum = jax.tree_util.tree_map(lambda g: g / steps, gsum)
-    loss = lsum / steps
-
-    updates, optim_state = optim.update(gsum, optim_state, p)
-    params = optax.apply_updates(p, updates)
+    loss = lsum / grad_accum_steps
     return params, loss, optim_state
 
 
@@ -221,6 +212,10 @@ def main():
             cautious_weight_decay=cfg.hparams.cautious_weight_decay,
         ),
     )
+
+    if grad_accum_steps > 1:
+        print("Using `MultiSteps` in optax for gradient accumulation...")
+        optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
 
     optim_state = optim.init(model)
 
