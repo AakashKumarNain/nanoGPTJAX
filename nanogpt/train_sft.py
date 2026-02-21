@@ -99,51 +99,41 @@ def train_step(
     return updated_params, loss, optim_state
 
 
-# fmt: off
-@partial(
-    jax.jit,
-    static_argnames=("optim", "grad_accum_steps", "head_dim"),
-    donate_argnums=(0, 1, 3, 4, 5,),
-)
+@partial(jax.jit, static_argnames=("optim", "grad_accum_steps", "head_dim"), donate_argnums=(0, 1, 3, 4, 5))  # fmt: off
 def train_step_accum(
     params,
-    x_batch, y_batch,  
-    segment_ids, positions,  
-    optim_state, optim,
+    x_batch,
+    y_batch,
+    segment_ids,
+    positions,
+    optim_state,
+    optim,
     head_dim,
     prompt_mask,
     grad_accum_steps,
 ):
-# fmt: on
+    # x_batch, y_batch: [grad_accum_steps, bsz, seqlen]
     freqs = jax.vmap(jitted_precompute_frequencies, in_axes=(0, None))(
         positions, head_dim
     )
 
-    def body(carry, microbatch):
-        p, gsum, lsum = carry
-
+    def accum_body(carry, microbatch):
+        p, opt_state, lsum = carry
         xb, yb, segb, freqb, maskb = microbatch
         loss, g = jax.value_and_grad(compute_loss)(p, xb, yb, segb, freqb, maskb)
+        updates, new_opt_state = optim.update(g, opt_state, p)
+        new_p = optax.apply_updates(p, updates)
+        return (new_p, new_opt_state, lsum + loss), None
 
-        gsum = jax.tree_util.tree_map(lambda a, b: a + b, gsum, g)
-        lsum = lsum + loss
-        return (p, gsum, lsum), None
-
-    g0 = jax.tree_util.tree_map(jnp.zeros_like, params)
-    carry0 = (params, g0, jnp.array(0.0, dtype=jnp.result_type(0.0)))
-    (p, gsum, lsum), _ = jax.lax.scan(
-        body,
+    carry0 = (params, optim_state, jnp.array(0.0, dtype=jnp.result_type(0.0)))
+    (params, optim_state, lsum), _ = jax.lax.scan(
+        accum_body,
         carry0,
         (x_batch, y_batch, segment_ids, freqs, prompt_mask),
         length=grad_accum_steps,
     )
 
-    steps = grad_accum_steps
-    gsum = jax.tree_util.tree_map(lambda g: g / steps, gsum)
-    loss = lsum / steps
-
-    updates, optim_state = optim.update(gsum, optim_state, p)
-    params = optax.apply_updates(p, updates)
+    loss = lsum / grad_accum_steps
     return params, loss, optim_state
 
 
@@ -202,7 +192,7 @@ def main():
     )
 
     desired_batch_size = cfg.hparams.desired_batch_size
-    grad_accum_steps = max(2, desired_batch_size // (bsz * seqlen))
+    grad_accum_steps = max(4, desired_batch_size // (bsz * seqlen))
 
     total_train_steps = cfg.hparams.total_train_steps
     max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
@@ -247,6 +237,10 @@ def main():
             cautious_weight_decay=0.0,
         ),
     )
+
+    if grad_accum_steps > 1:
+        print("Using `MultiSteps` in optax for gradient accumulation...")
+        optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
 
     optim_state = optim.init(model)
 
@@ -400,7 +394,7 @@ def main():
                 else:
                     es_patience_counter += 1
 
-                 # fmt: off
+                # fmt: off
                 if es_patience_counter > es_patience:
                     print(f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps.")
                     print(f"Total number of shards consumed : {num_shards_used}")
