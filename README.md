@@ -129,7 +129,12 @@ Contributions are welcome. Apart from bug fixes, the task list above is a good s
 - **Testing:** If you add or change functionality, include minimal tests or a small reproducible script to validate the change.
 - **Pull requests:** In your PR description, include (1) what changed, (2) why it changed, and (3) how to reproduce/verify. <br>
 
-We use `ruff` for linting and formatting. Please run `ruff check nanogpt/*.py` and `ruff format nanogpt/*.py` before sending a PR. We will streamline this process via `pre-commit` soon.  
+We use `ruff` for linting and formatting. You can either manually run `ruff check nanogpt/*.py` and `ruff format nanogpt/*.py` before sending a PR or you can
+install `pe-commit` and will do the job for you. To install pre-commit, use the following command:
+
+```
+uv tool install pre-commit --with pre-commit-uv
+```
 
 ## References
 
