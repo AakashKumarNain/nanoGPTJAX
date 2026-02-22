@@ -281,7 +281,7 @@ def main():
     num_shards_used = 0
     total_tokens_consumed = 0
 
-    # Resuable data buffers
+    # Reusable data buffers
     grad_accum_batch = np.zeros((grad_accum_steps, bsz, seqlen + 1), dtype=np.uint16)
     val_data_buf = np.zeros((bsz, seqlen + 1), dtype=np.uint16)
 
@@ -388,10 +388,10 @@ def main():
                     # Once we have trained on one shard, let's validate the performance as well
                     num_shards_used += 1
                     print(
-                        f"\nShard exhuasted.\nTotal shards consumed: {num_shards_used:<5}\nTotal Tokens consumed: {total_tokens_consumed:>9,}"
+                        f"\nShard exhausted.\nTotal shards consumed: {num_shards_used:<5}\nTotal Tokens consumed: {total_tokens_consumed:>9,}"
                     )
                     print("-" * 75)
-                    print("\nScoring model performance on vdalidation data...\n")
+                    print("\nScoring model performance on validation data...\n")
                     val_loss = 0.0
                     val_steps_count = 0
                     for shard in val_dl:
