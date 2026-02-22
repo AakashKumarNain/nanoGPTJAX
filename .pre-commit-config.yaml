@@ -1,0 +1,25 @@
+repos:
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  # Ruff version.
+  rev: v0.15.2
+    hooks:
+      - id: ruff-check
+        args: [--config, pyproject.toml, --fix]
+        files: ^nanogpt/
+        exclude: ^nanogpt/dev/
+        stages: [pre-commit]
+      - id: ruff-format
+        args: [--config, pyproject.toml]
+        files: ^nanogpt/
+        exclude: ^nanogpt/dev/
+        stages: [pre-commit]
+      - id: ruff-check
+        args: [--config, pyproject.toml]
+        files: ^nanogpt/
+        exclude: ^nanogpt/dev/
+        stages: [manual]
+      - id: ruff-format
+        args: [--config, pyproject.toml]
+        files: ^nanogpt/
+        exclude: ^nanogpt/dev/
+        stages: [manual]
