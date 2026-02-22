@@ -92,6 +92,9 @@ python nanogpt/inference.py
 After pretraining the model on first 30 shards of Fineweb10B tokens, here are some sample outputs from the mode:
 
 ```
+temperature = 0.8
+top_k = 100
+max_new_tokens = 50
 prompts = [
         "<|endoftext|>Did you notice that this world",
         "<|endoftext|>Hello World! My dear",
