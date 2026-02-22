@@ -96,19 +96,26 @@ prompts = [
         "<|endoftext|>Did you notice that this world",
         "<|endoftext|>Hello World! My dear",
         "<|endoftext|>Some say we are tired far",
-        "<|endoftext|>Hear that?",
+        "<|endoftext|>The capital of France",
     ]
 ---
 
 Completions:
 
-<|endoftext|>Did you notice that this world is filled with so many details and characters that children deserve? Does it feel like money and art hasn't stopped up the world of fantasy that it is obsessed with? Perhaps a cat ate ice cream while I screamed till the last minute. Or the things
+<|endoftext|>Did you notice that this world is filled with so many people and so many ideas?
+Well, I’m going to tell you about a few of them that I personally love.
+One is an article written for a few local blogs, one is for a national magazine
 
-<|endoftext|>Hello World! My dear friend Wendy who lives in Helsinki and it has been a great experience to have met some amazing new people at such amazing places! Many of these photos have not been taken since I arrived in Helsinki. While my colleagues quite frequently comment on how wonderful the locations
+<|endoftext|>Hello World! My dear friend,
+This is my first post in a while. I’m glad that I have found such amazing blog because this is really a place I would visit.
+If you haven’t read my past post, you’ll
 
-<|endoftext|>Some say we are tired far too soon. Unfortunately, a few weeks ago, my friend Julie Dossakis had her wedding day from a newly beautiful downtown Hotel with her gorgeous smile at the thought of the occasion. She said that “I’m going to just dress
+<|endoftext|>Some say we are tired far too easily. It’s true that we often feel tired and defeated when we’re not getting the right treatment.
+But the good news is that you can get the right treatment and get the right life.
+You don’
 
-<|endoftext|>Hear that? I run across while I sit on a station wagon in The Village Voice and the car stays silent and beeps. What is that like? Find out on one of our monthly Community Radio shows.\nTalk about the power of truth! Podcast Series\n
+<|endoftext|>The capital of France, Paris, is the birthplace of many art treasures. The city has a rich history of art and architecture, and a beautiful
+city park is a place to relax and enjoy the peace. The city also features a number of historical buildings and museums, which
 ```
 <br>
 
