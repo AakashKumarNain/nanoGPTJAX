@@ -386,51 +386,53 @@ def main():
 
                 except StopIteration:
                     # Once we have trained on one shard, let's validate the performance as well
-                    num_shards_used += 1
-                    print(
-                        f"\nShard exhausted.\nTotal shards consumed: {num_shards_used:<5}\nTotal Tokens consumed: {total_tokens_consumed:>9,}"
-                    )
-                    print("-" * 75)
+                    shard_processed_fully = True
+                    num_shards_used +=1
+                    print("Shard exhausted")
+                    print(f"Total shards consumed: {num_shards_used:<5}")
+                    print(f"Total Tokens consumed: {total_tokens_consumed:>9,}")
+                    print("-"*75)
+
                     print("\nScoring model performance on validation data...\n")
                     val_loss = 0.0
                     val_steps_count = 0
-                    for shard in val_dl:
-                        tokens = shard["tokens"]
-                        bos_idx = shard["bos_idx"]
-                        size = shard["size"]
-
+                    val_iter = iter(val_dl)
+                    for val_shard in val_iter:
+                        val_tokens = val_shard["tokens"]
                         try:
-                            bf = BOSFinder(tokens)
-                            bf.bos_idx = bos_idx
-                            bf.size = size
-                            if not bf.built_ready:
-                                _ = bf.build(bsz, seqlen)
-                            starts, ends = bf.next_batch(bsz, seqlen)
-                            # x, y = get_next_batch(starts, ends, bsz, seqlen, tokens, data_sharding,)
-                            get_next_batch(
-                                starts,
-                                ends,
-                                bsz,
-                                seqlen,
-                                tokens,
-                                data_sharding,
-                                val_data_buf,
-                            )
-                            curr_val_data = jnp.asarray(
-                                val_data_buf, dtype=jnp.int32, device=data_sharding
-                            )
-                            x = curr_val_data[:, :-1]
-                            y = curr_val_data[:, 1:]
-                            loss = val_step(model, x, y, freqs)
-                            val_loss += loss
-                            val_steps_count += 1
-                        except StopIteration:
-                            break
-                        finally:
-                            tokens.unlink_on_del()
-                    avg_val_loss = val_loss / val_steps_count
-                    jax.block_until_ready(avg_val_loss)
+                            val_bf = BOSFinder(val_tokens)
+                            val_bf.bos_idx = val_shard["bos_idx"]
+                            val_bf.size = val_shard["size"]
 
+                            num_val_batches = val_bf.build(bsz, seqlen)
+                            if num_val_batches <= 0:
+                                continue
+
+                            for _ in range(num_val_batches):
+                                starts, ends = val_bf.next_batch(bsz, seqlen)
+                                get_next_batch(
+                                    starts,
+                                    ends,
+                                    bsz,
+                                    seqlen,
+                                    val_tokens,
+                                    data_sharding,
+                                    val_data_buf
+                                )
+                                curr_val_data = jnp.asarray(
+                                    val_data_buf,
+                                    dtype=jnp.int32,
+                                    device=data_sharding
+                                )
+                                x = curr_val_data[:, :-1]
+                                y = curr_val_data[:, 1:]
+                                loss = val_step(model, x, y, None, freqs)
+                                val_loss += loss.item()
+                                val_steps_count += 1
+                        finally:
+                            val_tokens.unlink_on_del()
+                    avg_val_loss = val_loss / val_steps_count
+                    avg_val_loss = jax.block_until_ready(avg_val_loss)
                     improved = avg_val_loss < best_loss
                     if improved:
                         best_loss = avg_val_loss
@@ -440,15 +442,10 @@ def main():
                         es_patience_counter += 1
 
                     if es_patience_counter > es_patience:
-                        print(
-                            f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps."
-                        )
+                        print(f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps.")
                         print(f"Total number of shards consumed : {num_shards_used}")
-                        print(
-                            f"Best loss                       : {best_loss:.4f} at step {best_step}"
-                        )
+                        print(f"Best loss                       : {best_loss:.4f} at step {best_step}")
                         mngr.wait_until_finished()
-                        tokens.unlink_on_del()
                         training_complete = True
                         break
 
@@ -456,7 +453,6 @@ def main():
                     print(f"curr_val_loss : {avg_val_loss:.4f}")
                     print(f"Best loss     : {best_loss:.4f} at step {best_step}\n")
                     last_val_loss = avg_val_loss
-                    shard_processed_fully = True
         finally:
             tokens.unlink_on_del()
     train_end_time = time.time()
