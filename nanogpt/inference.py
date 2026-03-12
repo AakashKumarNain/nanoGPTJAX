@@ -117,6 +117,48 @@ def generate(
     return generated_tokens
 
 
+# This version can be used when you want to put a certain stop condition (e.g. max_new_tokens)
+# or stop_token in the loop and break out of it ASAP. scan does not let you break out of the
+# loop, but while_loop does. Though it allows you to break out early, you will still be using
+# same amount of memory as in scan!
+@partial(jax.jit, static_argnames=("head_dim", "max_new_tokens", "temperature", "top_k", "stop_token_id"))  # fmt: off
+def generate_v2(
+    params,
+    cache,
+    last_token,
+    generated_tokens,
+    head_dim,
+    decode_key,
+    temperature,
+    top_k,
+    max_new_tokens,
+    stop_token_id,
+):
+    def cond_fn(state):
+        _, _, _, generated_tokens, step, finished = state
+        return (~finished) & (step < max_new_tokens)
+
+    def body_fn(state):
+        cache, last_token, decode_key, generated_tokens, step, finished = state
+        logits, cache = decode(params, last_token, cache, head_dim)
+        decode_key, sub = jax.random.split(decode_key)
+        token = sample_from_logits(logits, sub, temperature, top_k)
+        generated_tokens = generated_tokens.at[:, step].set(token)
+        finished = jnp.all(token == stop_token_id)
+        return (cache, token[:, None], decode_key, generated_tokens, step + 1, finished)
+
+    state = (
+        cache,
+        last_token,
+        decode_key,
+        generated_tokens,
+        jnp.int32(1),
+        jnp.bool_(False),
+    )
+    _, _, _, generated_tokens, _, _ = jax.lax.while_loop(cond_fn, body_fn, state)
+    return generated_tokens
+
+
 def sample_from_model(
     key,
     prompts,
@@ -136,8 +178,6 @@ def sample_from_model(
     input_ids, segment_ids = pad_tokens(
         encoded, pad_id=pad_id, pad_to_power_of_two=pad_to_power_of_two
     )
-
-    # cache_key, decode_key = jax.random.split(key)
 
     # In case you want to reproduce the outputs shown in the Readme,
     # you can use these keys for cache and decoding
@@ -208,25 +248,27 @@ if __name__ == "__main__":
     max_new_tokens = 100
     top_k = 500
 
-    jax.set_mesh(cfg.mesh)
-
     # Warmup
     prompts = ["<|endoftext|>Did you hear the noise coming "] * len(devices)
     key = jax.random.PRNGKey(123)
     print("Warming up the model...")
 
-    for _ in range(3):
-        key, subkey = jax.random.split(key)
-        _ = sample_from_model(
-            subkey,
-            prompts,
-            tokenizer,
-            model,
-            max_new_tokens=max_new_tokens,
-            top_k=top_k,
-            pad_id=PAD_ID,
-            head_dim=cfg.model.attn.head_dim,
-        )
+    # Always make the compiler aware of the mesh context
+    # so that it does not do stupid things by trying being
+    # more smart!
+    with jax.set_mesh(cfg.mesh):
+        for _ in range(3):
+            key, subkey = jax.random.split(key)
+            _ = sample_from_model(
+                subkey,
+                prompts,
+                tokenizer,
+                model,
+                max_new_tokens=max_new_tokens,
+                top_k=top_k,
+                pad_id=PAD_ID,
+                head_dim=cfg.model.attn.head_dim,
+            )
     print("Warming up complete!\nGenerating...")
 
     rompts = [
@@ -237,16 +279,17 @@ if __name__ == "__main__":
     ]
     key, subkey = jax.random.split(key)
     start = time.perf_counter()
-    out = sample_from_model(
-        subkey,
-        prompts,
-        tokenizer,
-        model,
-        max_new_tokens=max_new_tokens,
-        top_k=top_k,
-        pad_id=PAD_ID,
-        head_dim=cfg.model.attn.head_dim,
-    )
+    with jax.set_mesh(cfg.mesh):
+        out = sample_from_model(
+            subkey,
+            prompts,
+            tokenizer,
+            model,
+            max_new_tokens=max_new_tokens,
+            top_k=top_k,
+            pad_id=PAD_ID,
+            head_dim=cfg.model.attn.head_dim,
+        )
     end = time.perf_counter()
     print(
         f"\nTime taken to generate {max_new_tokens * len(prompts)} tokens: {(end - start):.2f} seconds\n"
