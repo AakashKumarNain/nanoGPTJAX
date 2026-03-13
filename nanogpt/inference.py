@@ -11,8 +11,11 @@ from jax.sharding import Mesh
 
 from model import GPT, forward_v2
 from kvcache import KVCache, count_left_padding, prepare_chunk
-from checkpoint_utils import load_weights_from_checkpoint
+from checkpoint_utils import load_weights_from_checkpoint_with_validation
 from config import ShardingRules, Config, BATCH_AXIS_NAME
+
+from sft_dataloader import build_tokenizer
+from sft_dataloader import format_conversation
 
 
 def pad_tokens(tokens, pad_id, pad_to_power_of_two=False):
@@ -159,62 +162,32 @@ def generate_v2(
     return generated_tokens
 
 
-def sample_from_model(
-    key,
-    prompts,
-    tokenizer,
+@partial(jax.jit, static_argnames=("temperature", "head_dim", "max_new_tokens", "top_k"))  # fmt: off
+def generate(
     params,
-    max_new_tokens,
-    pad_id,
+    cache,
+    last_token,
+    generated_tokens,
     head_dim,
-    temperature=1.0,
-    top_k=500,
-    pad_to_power_of_two=True,
+    decode_key,
+    temperature,
+    top_k,
+    max_new_tokens,
 ):
-    # TODO: Move it out of this functions and shard the tokens
-    encoded = tokenizer.encode_batch(
-        prompts, allowed_special={"<|endoftext|>", "<|pad|>"}
+    def decode_body(carry, t):
+        cache, last_token, decode_key, generated_tokens = carry
+        logits, cache = decode(params, last_token, cache, head_dim)
+        decode_key, sub = jax.random.split(decode_key)
+        token = sample_from_logits(logits, sub, temperature, top_k)
+        generated_tokens = generated_tokens.at[:, t].set(token)
+        return (cache, token[:, None], decode_key, generated_tokens), None
+
+    (cache, last_token, decode_key, generated_tokens), _ = jax.lax.scan(
+        decode_body,
+        (cache, last_token, decode_key, generated_tokens),
+        jnp.arange(1, max_new_tokens),
     )
-    input_ids, segment_ids = pad_tokens(
-        encoded, pad_id=pad_id, pad_to_power_of_two=pad_to_power_of_two
-    )
-
-    # In case you want to reproduce the outputs shown in the Readme,
-    # you can use these keys for cache and decoding
-
-    # cache_key = jax.random.PRNGKey(1)
-    # decode_key = jax.random.PRNGKey(5)
-
-    cache_key, decode_key = jax.random.split(key)
-
-    batch_size = input_ids.shape[0]
-    cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
-    logits, next_tokens, cache = prefill(
-        model, input_ids, segment_ids, cache, head_dim, pad_id=pad_id
-    )
-    generated_tokens = (
-        jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
-        .at[:, 0]
-        .set(next_tokens)
-    )
-
-    # Decode loop via jitted scan
-    if max_new_tokens > 1:
-        last_token = next_tokens[:, None]
-        top_k = 0 if top_k is None else int(top_k)
-        generated = generate(
-            params,
-            cache,
-            last_token,
-            generated_tokens,
-            head_dim,
-            decode_key,
-            temperature=temperature,
-            top_k=top_k,
-            max_new_tokens=max_new_tokens,
-        )
-
-    return generated
+    return generated_tokens
 
 
 if __name__ == "__main__":
@@ -225,76 +198,175 @@ if __name__ == "__main__":
     sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
     cfg = Config(mesh=mesh, rules=sharding_rules)
 
+    # Although the model structure does not change between pretraining and SFT
+    # the performance of the model depends on the checkpoint being used. If you
+    # are testing for SFT, ensure you load the right checkpoint and test the model
+    # in the right way. A big difference between pretraining and SFT model is that
+    # the SFTed model would expect a chat_templated input(`format_conversation`
+    # function output in our case)
+    MODEL_TYPE = "pretrained"
+
     # Get the weight shardings
+    print("Building GPT model based on the config...")
+    model = GPT.init(jax.random.PRNGKey(0), cfg)
     model_sharding = GPT.shardings(cfg.mesh, cfg.rules, cfg.model)
-    print("Loading weights from the checkpoint...")
-    model = load_weights_from_checkpoint(cfg.load_ckpt_path, model_sharding)
+    print("Model built successfully!\n")
+    model = load_weights_from_checkpoint_with_validation(
+        cfg.ckpt_cfg.load_params_ckpt_path, model, model_sharding
+    )
     print("Weights loaded from the checkpoint successfully!")
 
-    base_tokenizer = tiktoken.get_encoding("gpt2")
-    PAD_TOKEN = "<|pad|>"
+    tok_info = build_tokenizer()
+    tokenizer = tok_info["tokenizer"]
+    user_start = tok_info["user_start"]
+    user_end = tok_info["user_end"]
+    assistant_start = tok_info["assistant_start"]
+    assistant_end = tok_info["assistant_end"]
+    pad_token = tok_info["pad_token"]
+    # custom_tokens = [user_start, user_end, assistant_start, assistant_end, pad_token]
+    custom_tokens = [t for t in tok_info["custom_token_ids"]]
 
-    tokenizer = tiktoken.Encoding(
-        name="gpt2_with_pad",
-        pat_str=base_tokenizer._pat_str,
-        mergeable_ranks=base_tokenizer._mergeable_ranks,
-        special_tokens={
-            **base_tokenizer._special_tokens,
-            PAD_TOKEN: base_tokenizer.n_vocab,  # next available token id
-        },
-    )
+    BOS_ID = tok_info["bos_id"]
+    PAD_ID = tok_info["pad_id"]
+    BOS = tok_info["bos"]
 
-    PAD_ID = tokenizer.encode(PAD_TOKEN, allowed_special={"<|pad|>"})[0]
+    head_dim = cfg.model.attn.head_dim
     max_new_tokens = 100
     top_k = 500
+    temperature = 0.8
 
-    # Warmup
-    prompts = ["<|endoftext|>Did you hear the noise coming "] * len(devices)
-    key = jax.random.PRNGKey(123)
-    print("Warming up the model...")
+    if MODEL_TYPE == "pretrained":
+        # Warmup the model with some fake inputs first
+        prompts = ["<|endoftext|>Did you hear the noise coming "] * len(devices)
+        encoded = tokenizer.encode_batch(prompts, allowed_special="all")
+        input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
+        key = jax.random.PRNGKey(123)
+        print("Warming up the model...")
 
-    # Always make the compiler aware of the mesh context
-    # so that it does not do stupid things by trying being
-    # more smart!
-    with jax.set_mesh(cfg.mesh):
-        for _ in range(3):
+        # Set the cache
+        cache_key = jax.random.PRNGKey(1)
+        batch_size = input_ids.shape[0]
+        cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
+
+        # Always make the compiler aware of the mesh context
+        # so that it does not do stupid things by trying being
+        # more smart!
+        with jax.set_mesh(cfg.mesh):
             key, subkey = jax.random.split(key)
-            _ = sample_from_model(
-                subkey,
-                prompts,
-                tokenizer,
-                model,
-                max_new_tokens=max_new_tokens,
-                top_k=top_k,
-                pad_id=PAD_ID,
-                head_dim=cfg.model.attn.head_dim,
+            _, next_tokens, temp_cache = prefill(
+                model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
             )
-    print("Warming up complete!\nGenerating...")
 
-    rompts = [
-        "<|endoftext|>Did you notice that this world",
-        "<|endoftext|>Hello World! My dear",
-        "<|endoftext|>Some say we are tired far",
-        "<|endoftext|>Hear that?",
-    ]
-    key, subkey = jax.random.split(key)
-    start = time.perf_counter()
-    with jax.set_mesh(cfg.mesh):
-        out = sample_from_model(
-            subkey,
-            prompts,
-            tokenizer,
-            model,
-            max_new_tokens=max_new_tokens,
-            top_k=top_k,
-            pad_id=PAD_ID,
-            head_dim=cfg.model.attn.head_dim,
+            generated_tokens = (
+                jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
+                .at[:, 0]
+                .set(next_tokens)
+            )
+            last_token = next_tokens[:, None]
+            generated = generate(
+                model,
+                temp_cache,
+                last_token,
+                generated_tokens,
+                head_dim,
+                subkey,
+                temperature=temperature,
+                top_k=top_k,
+                max_new_tokens=max_new_tokens,
+            )
+        print("Warming up complete!\nGenerating...")
+
+        prompts = [
+            "<|endoftext|>Did you notice that this world",
+            "<|endoftext|>Hello World! My dear",
+            "<|endoftext|>Some say we are tired far",
+            "<|endoftext|>Hear that?",
+        ]
+        encoded = tokenizer.encode_batch(prompts, allowed_special="all")
+        input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
+        key, subkey = jax.random.split(key)
+
+        start = time.perf_counter()
+        with jax.set_mesh(cfg.mesh):
+            _, next_tokens, cache = prefill(
+                model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
+            )
+
+        generated_tokens = (
+            jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
+            .at[:, 0]
+            .set(next_tokens)
         )
-    end = time.perf_counter()
-    print(
-        f"\nTime taken to generate {max_new_tokens * len(prompts)} tokens: {(end - start):.2f} seconds\n"
-    )
-    decoded = tokenizer.decode_batch(out.tolist())
+        last_token = next_tokens[:, None]
+
+        with jax.set_mesh(cfg.mesh):
+            generated = generate(
+                model,
+                temp_cache,
+                last_token,
+                generated_tokens,
+                head_dim,
+                subkey,
+                temperature=temperature,
+                top_k=top_k,
+                max_new_tokens=max_new_tokens,
+            )
+        end = time.perf_counter()
+        print(
+            f"Time taken to generate {max_new_tokens * len(prompts)} tokens: {(end - start):.2f} seconds"
+        )
+        decoded = tokenizer.decode_batch(generated.tolist())
+
+    elif MODEL_TYPE == "SFT":
+        examples = {
+            "messages": [
+                {
+                    "content": 'What are the benefits of regular exercise? Your response should contain at least 3 sentences. Include keywords such as "health", "reduce", and "improve".\n',
+                    "role": "user",
+                },
+            ],
+        }
+        prompts = [
+            format_conversation(ex, tok_info)["text"] + assistant_start
+            for ex in examples
+        ]
+        encoded = tokenizer.encode_batch(prompts, allowed_special="all")
+        input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
+        # Set the cache
+        cache_key = jax.random.PRNGKey(1)
+        batch_size = input_ids.shape[0]
+        cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
+
+        key = jax.random.PRNGKey(123)
+        key, subkey = jax.random.split(key)
+
+        with jax.set_mesh(cfg.mesh):
+            _, next_tokens, cache = prefill(
+                model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
+            )
+
+        generated_tokens = (
+            jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
+            .at[:, 0]
+            .set(next_tokens)
+        )
+        last_token = next_tokens[:, None]
+
+        with jax.set_mesh(cfg.mesh):
+            generated = generate_v2(
+                model,
+                cache,
+                last_token,
+                generated_tokens,
+                head_dim,
+                subkey,
+                temperature=temperature,
+                top_k=top_k,
+                max_new_tokens=max_new_tokens,
+                stop_token_id=tok_info["assistant_end_id"],
+            )
+
+        decoded = tokenizer.decode_batch(generated.tolist())
 
     for p, d in zip(prompts, decoded):
         print(f"Prompt: {p}")
