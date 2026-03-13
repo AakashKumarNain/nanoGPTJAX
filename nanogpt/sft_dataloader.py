@@ -159,8 +159,17 @@ def decode_mask_from_ids(batch):
     return batch
 
 
-def format_conversation(example, tok_info):
-    """Format a single or multi-turn chat example into a string ready for tokenisation."""
+def format_conversation(example, tok_info, check_assistant_role=True):
+    """Format a single or multi-turn chat example into a string ready
+        for tokenization.
+
+    Args:
+        example (dict): A conversation packed in a dict with some roles
+        tok_info: A dictionary containing information about the tokenizer
+        check_assistant_role (bool): Check if there are any completion
+            message in the formatted conversation or not. Defaults to True
+
+    """
     messages = example.get("messages", [])
     if not messages:
         return None
@@ -177,11 +186,15 @@ def format_conversation(example, tok_info):
         start_key, end_key = ROLE_MAP[role]
         parts.append(f"{tok_info[start_key]}{content}{tok_info[end_key]}\n")
 
-    roles = {m.get("role") for m in messages}
-
-    # We only want samples where we have assistant completions
-    if "assistant" not in roles:
-        return None
+    if check_assistant_role:
+        # This is only applicable during training where we are formatting
+        # conversations and masking out non-completion tokens. There might be
+        # cases where we do not have the completion tokens in the formatted
+        # text (too lengthy conv, bad sample, etc). In those case, it is better
+        # to skip those samples.
+        roles = {m.get("role") for m in messages}
+        if "assistant" not in roles:
+            return None
 
     return {"text": "".join(parts)}
 
