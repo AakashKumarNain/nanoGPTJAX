@@ -179,6 +179,7 @@ class ModelConfig:
                 d_emb=self.d_emb,
                 q_heads=self.q_heads,
                 kv_heads=self.kv_heads,
+                num_layers=self.num_layers
             )
         self.mlp = MLPConfig(dtype=self.dtype, d_emb=self.d_emb)
         self.lm_head = LinearConfig(
