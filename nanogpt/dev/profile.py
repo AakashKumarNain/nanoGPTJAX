@@ -1,85 +1,184 @@
 import os
+
+# Set some GPU FLAGS
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ["NCCL_NVLS_ENABLE"] = "1"
+os.environ.update(
+    {
+        "NCCL_LL128_BUFFSIZE": "-2",
+        "NCCL_LL_BUFFSIZE": "-2",
+        "NCCL_PROTO": "SIMPLE,LL,LL128",
+    }
+)
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_triton_gemm_any=True "
+    "--xla_gpu_enable_latency_hiding_scheduler=true "
+    "--xla_gpu_enable_pipelined_all_reduce=true "
+    "--xla_gpu_enable_pipelined_all_gather=true "
+    "--xla_gpu_enable_pipelined_reduce_scatter=true "
+#     "--xla_gpu_enable_while_loop_double_buffering=true "
+#     "--xla_gpu_enable_pipelined_p2p=true "
+#     "--xla_gpu_collective_permute_decomposer_threshold=1024 "
+)
 import warnings
 import logging
 import time
+import dataclasses
 from pathlib import Path
 from functools import partial
 
-from fineweb_dataloader import make_grain_shard_loader, BOSFinder
-
 import jax
+
+jax.config.update("jax_optimization_level", "O1")
+
 import optax
-import grain
 import numpy as np
 import jax.numpy as jnp
-import orbax.checkpoint as ocp
 from jax.sharding import Mesh
 from jax.sharding import set_mesh
-from jax.tree_util import GetAttrKey, SequenceKey, DictKey
-
 
 from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward
 from utils import logical_to_sharding
-from config import ShardingRules, Config, BATCH_AXIS_NAME
+from optim import build_optimizer
+from custom_loss import (
+    DEFAULT_CHUNK_SIZE,
+    chunked_softmax_cross_entropy_with_integer_labels,
+)
+from config import (
+    Config,
+    ShardingRules,
+    BATCH_AXIS_NAME,
+    TENSOR_ONLY_AXIS_NAME,
+)
+from fineweb_dataloader import make_grain_shard_loader, BOSFinder
 
 
 logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
 
 
-policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-forward_remat = jax.checkpoint(forward, policy=policy)
+PROFILE_LOSS_IMPL = os.environ.get("PROFILE_LOSS_IMPL", "chunked").lower()
+PROFILE_CE_CHUNK_SIZE = int(
+    os.environ.get("PROFILE_CE_CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE))
+)
 
-def compute_loss(params, x_batch, y_batch, freqs):
-    logits = forward_remat(params, x_batch, freqs)
-    loss = jnp.mean(
-        optax.losses.softmax_cross_entropy_with_integer_labels(
-            logits=logits, labels=y_batch
-        )
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeShardings:
+    embed_act: jax.sharding.Sharding
+    logits: jax.sharding.Sharding
+
+
+def compute_loss(
+    params,
+    x_batch,
+    y_batch,
+    segment_ids,
+    freqs,
+    loss_mask,
+    runtime_shardings,
+):
+    logits = forward(
+        params,
+        x_batch,
+        segment_ids,
+        freqs,
+        runtime_shardings.embed_act,
+        runtime_shardings.logits,
     )
-    return loss, logits
+    if PROFILE_LOSS_IMPL == "chunked":
+        return chunked_softmax_cross_entropy_with_integer_labels(
+            logits,
+            y_batch,
+            loss_mask,
+            chunk_size=PROFILE_CE_CHUNK_SIZE,
+        )
+    elif PROFILE_LOSS_IMPL == "dense":
+        if loss_mask is not None:
+            per_token_loss = optax.losses.softmax_cross_entropy_with_integer_labels(
+                logits=logits,
+                labels=y_batch,
+                where=loss_mask,
+            )
+            return jnp.sum(per_token_loss) / jnp.maximum(jnp.sum(loss_mask), 1.0)
+        else:
+            return jnp.mean(
+                optax.losses.softmax_cross_entropy_with_integer_labels(
+                    logits=logits, labels=y_batch
+                )
+            )
+    else:
+        raise ValueError(
+            f"Unsupported PROFILE_LOSS_IMPL={PROFILE_LOSS_IMPL!r}. Use 'chunked' or 'dense'."
+        )
 
-@partial(jax.jit, static_argnames=("optim", "grad_accum_steps"), donate_argnums=(0, 1, 4))
-def train_step_accum(params, x_batch, y_batch, freqs, optim_state, optim, grad_accum_steps):
-    # x_batch, y_batch: [grad_accum_steps, bsz, seqlen]
+
+@partial(
+    jax.jit,
+    static_argnames=("optim", "grad_accum_steps", "runtime_shardings"),
+    donate_argnums=(0, 1, 3, 4, 5),
+)
+def train_step_accum(
+    params,
+    x_batch,
+    y_batch,
+    segment_ids,
+    freqs,
+    optim_state,
+    optim,
+    grad_accum_steps,
+    runtime_shardings,
+):
     def body(carry, xy):
-        p, gsum, lsum = carry
+        param, opt_state, lsum = carry
         xb, yb = xy
-        (loss, _), g = jax.value_and_grad(compute_loss, has_aux=True)(p, xb, yb, freqs)
-        gsum = jax.tree_util.tree_map(lambda a, b: a + b, gsum, g)
-        lsum = lsum + loss
-        return (p, gsum, lsum), None
+        loss, grad = jax.value_and_grad(compute_loss)(
+            param, xb, yb, segment_ids, freqs, None, runtime_shardings
+        )
 
-    g0 = jax.tree_util.tree_map(jnp.zeros_like, params)
-    carry0 = (params, g0, jnp.array(0.0, dtype=jnp.result_type(0.0)))
-    (p, gsum, lsum), _ = jax.lax.scan(body, carry0, (x_batch, y_batch), length=grad_accum_steps)
+        # MultiSteps accumulates grad internally and returns a zero-tree update on
+        # every micro-step except the last, where it emits the real update.
+        updates, new_opt_state = optim.update(grad, opt_state, param)
+        new_param = optax.apply_updates(param, updates)
+        return (new_param, new_opt_state, lsum + loss), None
 
-    steps = grad_accum_steps
-    gsum = jax.tree_util.tree_map(lambda g: g / steps, gsum)
-    loss = lsum / steps
-
-    updates, optim_state = optim.update(gsum, optim_state, p)
-    params = optax.apply_updates(p, updates)
+    carry0 = (params, optim_state, jnp.array(0.0, dtype=jnp.result_type(0.0)))
+    (params, optim_state, lsum), _ = jax.lax.scan(
+        body, carry0, (x_batch, y_batch), length=grad_accum_steps
+    )
+    loss = lsum / grad_accum_steps
     return params, loss, optim_state
 
 
-
-@partial(jax.jit, static_argnames=("optim",), donate_argnums=(0, 4))
-def train_step(params, x_batch, y_batch, freqs, optim_state, optim):
-    (loss, logits), grads = jax.value_and_grad(compute_loss, has_aux=True)(
-        params, x_batch, y_batch, freqs
+@partial(
+    jax.jit,
+    static_argnames=("optim", "runtime_shardings"),
+    donate_argnums=(0, 1, 3, 4, 5),
+)
+def train_step(
+    params,
+    x_batch,
+    y_batch,
+    segment_ids,
+    freqs,
+    optim_state,
+    optim,
+    runtime_shardings,
+):
+    loss, grads = jax.value_and_grad(compute_loss)(
+        params,
+        x_batch,
+        y_batch,
+        segment_ids,
+        freqs,
+        None,
+        runtime_shardings,
     )
     updates, optim_state = optim.update(grads, optim_state, params)
     updated_params = optax.apply_updates(params, updates)
     return updated_params, loss, optim_state
-
-
-@jax.jit
-def val_step(params, x_batch, y_batch, freqs):
-    loss, _ = compute_loss(params, x_batch, y_batch, freqs)
-    return loss
 
 
 def line(label, value, comma=False, label_w=30, colon_w=2, value_w=20):
@@ -87,223 +186,137 @@ def line(label, value, comma=False, label_w=30, colon_w=2, value_w=20):
     return f"{label:<{label_w}}{':':<{colon_w}}{value:{fmt}}"
 
 
-def build_optimizer(
-    params,
-    *,
-    d_model: int,                    
-    other_peak_lr: float,           
-    other_min_lr: float,            
-    total_train_steps: int,
-    warmup_steps: int = 30,
-    b1: float = 0.9,                
-    b2: float = 0.95,           
-    embedding_lr: float = 3e-3,
-    unembedding_lr: float = 3e-4,
-    use_muon=True
-
-):
-    """
-    Parameter groups:
-      - params.embed      -> AdamW with nanochat embedding LR (scaled by (d_model/768)^-0.5)
-      - params.lm_head    -> AdamW with nanochat unembedding LR (scaled by (d_model/768)^-0.5)
-      - everything else   -> AdamW with warmup+cosine schedule
-
-    Returns: (optax_transform, param_labels)
-    """
-
-    # nanochat's width scaling for AdamW groups: (d_model / 768) ** -0.5
-    dmodel_lr_scale = (d_model / 768.0) ** -0.5
-
-    # emb_lr = embedding_lr * dmodel_lr_scale
-    # unemb_lr = unembedding_lr * dmodel_lr_scale
-    emb_lr = embedding_lr * other_peak_lr
-    unemb_lr = 1.0 * other_peak_lr
-
-    if use_muon:
-        print("Using Muon Optimizer!")
-        other_peak_lr = max(other_peak_lr, 2e-2)
-
-
-    schedules = {
-        "embed": optax.constant_schedule(emb_lr),
-        "lm_head": optax.constant_schedule(unemb_lr),
-        "other": optax.warmup_cosine_decay_schedule(
-            init_value=other_min_lr,
-            peak_value=other_peak_lr,
-            warmup_steps=warmup_steps,
-            decay_steps=max(1, total_train_steps - warmup_steps),
-            end_value=other_min_lr,
-        ),
-    }
-
-    def _path_names(path):
-        out = []
-        for k in path:
-            if isinstance(k, GetAttrKey):
-                out.append(k.name)
-            elif isinstance(k, SequenceKey):
-                out.append(str(k.idx))
-            elif isinstance(k, DictKey):
-                out.append(str(k.key))
-            else:
-                out.append(str(k))
-        return out
-
-    def label_fn(path, leaf):
-        # Top-level fields in your GPT pytree: embed, blocks, lm_head
-        names = _path_names(path)
-        top = names[0] if names else ""
-        if top == "embed":
-            return "embed"
-        if top == "lm_head":
-            return "lm_head"
-        return "other"
-
-    param_labels = jax.tree_util.tree_map_with_path(label_fn, params)
-
-    def make_adamw(lr_schedule, weight_decay=0.0):
-        return optax.adamw(
-            learning_rate=lr_schedule,
-            b1=b1,
-            b2=b2,
-            weight_decay=weight_decay,
-            mu_dtype=jnp.float32
-        )
-
-    def make_weight_dim_nums(p):
-        def choose(x):
-            s = getattr(x, "shape", None)
-            if s is None:
-                return None
-            if len(s) == 2:
-                return optax.contrib.MuonDimensionNumbers((0,), (1,))
-            if len(s) == 3:
-                if s[-1] == d_model:       # wo: (heads, head_dim, d_model)
-                    return optax.contrib.MuonDimensionNumbers((1,), (2,))
-                return optax.contrib.MuonDimensionNumbers((0,), (2,))  # wq/wk/wv: batch=heads
-            return None
-        return jax.tree_util.tree_map(choose, p)
-
-    muon_weight_dim_nums = make_weight_dim_nums(params)
-
-    def weight_decay_mask_fn(p):
-        def keep(x):
-            s = getattr(x, "shape", None)
-            return s is not None and len(s) >= 2
-        return jax.tree_util.tree_map(keep, p)
-
-    muon_wd_mask = weight_decay_mask_fn(params)
-
-
-    def make_muon(lr_schedule, weight_decay=0.0):
-        return optax.contrib.muon(
-            learning_rate=lr_schedule,
-            ns_coeffs=(3.4445, -4.775, 2.0315), 
-            ns_steps=3,#5,
-            beta=b2,
-            eps=1e-8,
-            # weight_decay=weight_decay,
-            weight_decay=weight_decay,
-            weight_decay_mask=muon_wd_mask,#wd_mask_fn,
-            mu_dtype=jnp.float32,
-            nesterov=True,
-            adaptive=False,
-            adam_b1=b1,
-            adam_b2=b2,
-            adam_eps_root=0.0,
-            adam_weight_decay=weight_decay,
-            muon_weight_dimension_numbers=muon_weight_dim_nums,#muon_dims_fn,
-            consistent_rms=None
-        )
-
-    # then change only the "other" branch of the multi_transform to use Muon
-    tx = optax.multi_transform(
-        {
-            "embed": make_adamw(schedules["embed"]),
-            "lm_head": make_adamw(schedules["lm_head"]),
-            "other": make_muon(schedules["other"], weight_decay=0.001) if use_muon else make_adamw(schedules["other"], weight_decay=0.001),
-        },
-        param_labels,
+def model_run_name(cfg):
+    return (
+        f"{cfg.model.attn_type}"
+        f"_L{cfg.model.num_layers}"
+        f"_D{cfg.model.d_emb}"
+        f"_Q{cfg.model.q_heads}"
+        f"_KV{cfg.model.kv_heads}"
+        f"_H{cfg.model.attn.head_dim}"
+        f"_T{cfg.model.seqlen}"
+        f"_V{cfg.model.vocab_size}"
     )
-    return tx
 
 
-def get_next_batch(starts, ends, bsz, seqlen, tokens, data_sharding, transfer_to_device=True, out_tokens_u16=None):
-    # out_tokens_u16: (bsz, seqlen+1) uint16 workspace; if None, allocate once here (compat fallback)
-    if out_tokens_u16 is None:
-        out_tokens_u16 = np.empty((bsz, seqlen + 1), dtype=np.uint16)
+def get_next_batch(
+    starts,
+    ends,
+    bsz,
+    seqlen,
+    tokens,
+    data_sharding,
+    buf_u16,
+    transfer_to_device=False,
+    create_new_buf=False,
+):
+    """Gathers batches of input-labels pairs."""
+    if buf_u16 is None and create_new_buf:
+        buf_u16 = np.empty((bsz, seqlen + 1), dtype=np.uint16)
 
     ptr = 0
     for i, j in zip(starts, ends):
         n = j - i
         row = ptr // (seqlen + 1)
         col = ptr % (seqlen + 1)
-        out_tokens_u16[row, col:col + n] = tokens[i:j]
+        buf_u16[row, col : col + n] = tokens[i:j]
         ptr += n
 
-    # Optional device path: single H2D for tokens; slice into x/y on device
-    if transfer_to_device:
-        dev_tokens_u16 = jax.device_put(out_tokens_u16, data_sharding)
-        dev_tokens_i32 = jax.lax.convert_element_type(dev_tokens_u16, jnp.int32)
-        x = dev_tokens_i32[:, :-1]
-        y = dev_tokens_i32[:, 1:]
-        return x, y
+    if not create_new_buf:
+        return None
     else:
-        return None, None
+        if transfer_to_device:
+            x = jax.device_put(buf_u16[:, :-1], data_sharding)
+            y = jax.device_put(buf_u16[:, 1:], data_sharding)
+        else:
+            x = buf_u16[:, :-1]
+            y = buf_u16[:, 1:]
+        return x, y
+
+
+def prepare_step_batch(bf, tokens, batch_buf, bsz, seqlen, grad_accum_steps, data_accum_sharding):
+    with jax.profiler.TraceAnnotation("host_stack"):
+        for micro_step in range(grad_accum_steps):
+            starts, ends = bf.next_batch(bsz, seqlen)
+            get_next_batch(
+                starts,
+                ends,
+                bsz,
+                seqlen,
+                tokens,
+                data_accum_sharding,
+                batch_buf[micro_step],
+                transfer_to_device=False,
+            )
+
+    with jax.profiler.TraceAnnotation("h2d"):
+        stacked_batch = jnp.asarray(batch_buf, dtype=jnp.int32, device=data_accum_sharding)
+
+    stacked_x = stacked_batch[:, :, :-1]
+    stacked_y = stacked_batch[:, :, 1:]
+    return stacked_x, stacked_y
 
 
 def main():
+    profile_start_step = int(os.environ.get("PROFILE_START_STEP", "5"))
+    profile_end_step = int(os.environ.get("PROFILE_END_STEP", "15"))
+    profile_logdir = Path(os.environ.get("PROFILE_LOGDIR", "profile-data")) / "chunked_cce"
+    if profile_end_step <= profile_start_step:
+        raise ValueError("PROFILE_END_STEP must be greater than PROFILE_START_STEP")
 
-    # Get the mesh, sharding rules, amd the config
     devices = np.array(jax.devices())
     print("Number of devices found:", len(devices))
-    mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
-    sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
+    data_parallel_size = tensor_parallel_size = 2
+    mesh = Mesh(
+        devices.reshape(data_parallel_size, tensor_parallel_size),
+        axis_names=(BATCH_AXIS_NAME, TENSOR_ONLY_AXIS_NAME),
+    )
+    sharding_rules = ShardingRules(
+        batch=BATCH_AXIS_NAME,
+        vocab_out=TENSOR_ONLY_AXIS_NAME if tensor_parallel_size > 1 else None,
+    )
     cfg = Config(mesh=mesh, rules=sharding_rules)
 
     train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
-    val_files = list(Path(cfg.data_dir).glob("*val*.bin"))
     num_train_files = len(train_files)
-    num_val_files = len(val_files)
     print("\nNumber of train files found: ", num_train_files)
-    print("Number of validation files found: ", num_val_files)
-    
-    train_dl = make_grain_shard_loader(train_files, prefetch=16, num_threads=32, prefetch_buffer_size=256)
-    val_dl = make_grain_shard_loader(val_files, prefetch=0, num_threads=16, prefetch_buffer_size=256)
+
+    train_dl = make_grain_shard_loader(
+        train_files, prefetch=16, num_threads=32, prefetch_buffer_size=16
+    )
     train_iter = iter(train_dl)
 
-
     per_device_bsz = cfg.hparams.per_device_batch_size
-    bsz = per_device_bsz * len(devices)
+    dp_size = cfg.mesh.shape[BATCH_AXIS_NAME]
+    tp_size = cfg.mesh.shape["y"]
+    bsz = per_device_bsz * dp_size
     seqlen = cfg.model.seqlen
     head_dim = cfg.model.attn.head_dim
-    data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
+    data_accum_sharding = logical_to_sharding(
+        (None, "batch", None), cfg.mesh, cfg.rules
+    )
+    runtime_shardings = RuntimeShardings(
+        embed_act=logical_to_sharding(
+            ("batch", "sequence", "act_embed"), cfg.mesh, cfg.rules
+        ),
+        logits=logical_to_sharding(
+            ("batch", "sequence", "vocab_out"), cfg.mesh, cfg.rules
+        ),
+    )
 
     max_lr = cfg.hparams.max_lr
     min_lr = 0.01 * max_lr
     warmup_steps = cfg.hparams.warmup_steps
     desired_batch_size = cfg.hparams.desired_batch_size
-    grad_accum_steps = max(4, desired_batch_size // (bsz * seqlen))
-    
-    b1 = cfg.hparams.b1
-    b2 = cfg.hparams.b2
-    weight_decay = cfg.hparams.weight_decay
-    grad_clip_norm = cfg.hparams.grad_clip_norm
-    
+    grad_accum_steps = 2#min(4, max(2, desired_batch_size // (bsz * seqlen)))
     total_train_steps = cfg.hparams.total_train_steps
-    max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
-    checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
 
-
-    # Load the model
     print("Building GPT model based on the config...")
     model = GPT.init(jax.random.PRNGKey(0), cfg)
     print("Model built successfully!")
 
-
-    # Optimizer
     optim = optax.chain(
-        optax.clip_by_global_norm(grad_clip_norm),
+        optax.clip_by_global_norm(cfg.hparams.grad_clip_norm),
         build_optimizer(
             model,
             d_model=cfg.model.d_emb,
@@ -311,158 +324,184 @@ def main():
             other_min_lr=min_lr,
             total_train_steps=total_train_steps,
             warmup_steps=warmup_steps,
-        )
+            b1=cfg.hparams.b1,
+            b2=cfg.hparams.b2,
+            embedding_lr=cfg.hparams.embedding_lr,
+            weight_decay=cfg.hparams.weight_decay,
+            cautious_weight_decay=cfg.hparams.cautious_weight_decay,
+        ),
     )
 
-
-    # No grad accum for now
     if grad_accum_steps > 1:
-        print("Applying grad accum schedule to the optimizer...")
-        # optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
-    optim_state = optim.init(model)
+        print("Using `MultiSteps` in optax for gradient accumulation...")
+        optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
 
+    optim_state = optim.init(model)
 
     print("")
     print("-" * 75)
     print("")
-
-
+    print(line("Run name", model_run_name(cfg), value_w=30))
+    print(line("Attention type", cfg.model.attn_type))
+    print(line("Model dtype", str(cfg.model.dtype)))
+    print(line("Num layers", cfg.model.num_layers))
+    print(line("Embedding dim", cfg.model.d_emb))
+    print(line("Query heads", cfg.model.q_heads))
+    print(line("KV heads", cfg.model.kv_heads))
+    print(line("Head dim", cfg.model.attn.head_dim))
+    print(line("MLP hidden dim", cfg.model.mlp.fc1.out_features))
+    print(line("Vocab size", cfg.model.vocab_size))
     print(line("Number of trainable params: ", count_params(model), comma=True))
     print(line("Sequence length per sample", seqlen))
     print(line("Per device batch size", per_device_bsz))
+    print(line("Data parallel size", dp_size))
+    print(line("Tensor parallel size", tp_size))
     print(line("Total batch size", bsz))
     print(line("Grad accumulation steps", grad_accum_steps))
     print()
-    print(line("LR (min, max)", str((min_lr, max_lr))))
-    print(line("Warmup steps", warmup_steps))
-    print(line("Weight decay", weight_decay), "\n")
+    print(line("LR (min, max)", str((f"{min_lr:.6f}", f"{max_lr:.6f}"))))
+    print(line("Warmup steps", cfg.hparams.warmup_steps))
+    print(line("Weight decay", cfg.hparams.weight_decay), "\n")
+    print(line("Profile loss impl", PROFILE_LOSS_IMPL))
+    print(line("Profile CE chunk size", PROFILE_CE_CHUNK_SIZE))
+    print(line("Profile start step", profile_start_step))
+    print(line("Profile end step", profile_end_step))
+    print(line("Profile logdir", str(profile_logdir)))
     print("-" * 75)
 
-
-    # Compute the frequencies
     positions = jnp.arange(seqlen)[None, :]
     with set_mesh(cfg.mesh):
         freqs = precompute_frequencies(positions=positions, features=head_dim)
 
-    num_shards_used = 0
+    segment_ids = None
     step = 0
-    print("Starting training (the first step will take some time for compilation...)\n")
+    num_shards_used = 0
     profiling_complete = False
-    profile_start_step = 5
-    profile_end_step = 20
+    train_start_time = time.time()
 
-    data_accum_sharding = logical_to_sharding((None, "batch", None), cfg.mesh, cfg.rules)
-    # batch_x = np.zeros((grad_accum_steps, bsz, seqlen), dtype=np.int32)
-    # batch_y = np.zeros((grad_accum_steps, bsz, seqlen), dtype=np.int32)
-    
     batch_tokens0 = np.empty((grad_accum_steps, bsz, seqlen + 1), dtype=np.uint16)
     batch_tokens1 = np.empty((grad_accum_steps, bsz, seqlen + 1), dtype=np.uint16)
-    batch_x = batch_tokens0[:, :, :-1]  # host view (uint16); kept for name compatibility
-    batch_y = batch_tokens0[:, :, 1:]   # host view (uint16); kept for name compatibility
 
+    print("Starting profiling run (the first step will take some time for compilation...)\n")
 
-
-    # Training loop with explicit counter
     for shard in train_iter:
-
         if profiling_complete:
             break
-        
-        tokens = shard["tokens"]        # SharedMemoryArray(uint16, shape=[num_tokens])
-        bos_idx = shard["bos_idx"]      # np.ndarray of BOS positions
+
+        tokens = shard["tokens"]
+        bos_idx = shard["bos_idx"]
         size = shard["size"]
         shard_name = Path(shard["path"]).name
 
         try:
-
-            # Optional: reuse your BOSFinder but skip its thread methods.
             bf = BOSFinder(tokens)
             bf.bos_idx = bos_idx
             bf.size = size
-            
             shard_processed_fully = False
-            # NEW: build the static index once per shard (on-demand)
+
             num_batches_in_shard = bf.build(bsz, seqlen)
             print(f"\n=== Processing Shard: {num_shards_used} with name: {shard_name}", end=" | ")
             print(f"Indexed {num_batches_in_shard} batches ===")
-            
-            while not shard_processed_fully:
+
+            while not shard_processed_fully and not profiling_complete:
                 try:
                     if step < profile_start_step:
                         start = time.time()
-                        for micro_step in range(grad_accum_steps):
-                            starts, ends = bf.next_batch(bsz, seqlen)
-                            get_next_batch(starts, ends, bsz, seqlen, tokens, data_accum_sharding, transfer_to_device=False, out_tokens_u16=batch_tokens0[micro_step])
-
-                        # One H2D for stacked tokens; cast + slice on device
-                        stacked_tokens = jax.device_put(batch_tokens0, data_accum_sharding)
-                        stacked_tokens_i32 = jax.lax.convert_element_type(stacked_tokens, jnp.int32)
-                        stacked_x = stacked_tokens_i32[:, :, :-1]
-                        stacked_y = stacked_tokens_i32[:, :, 1:]
-                        
-                        model, loss, optim_state = train_step_accum(model, stacked_x, stacked_y, freqs, optim_state, optim, grad_accum_steps)
-                        avg_train_loss = loss
-
-                        # Block for accurate timing
-                        jax.block_until_ready(avg_train_loss)
+                        stacked_x, stacked_y = prepare_step_batch(
+                            bf,
+                            tokens,
+                            batch_tokens0,
+                            bsz,
+                            seqlen,
+                            grad_accum_steps,
+                            data_accum_sharding,
+                        )
+                        model, loss, optim_state = train_step_accum(
+                            model,
+                            stacked_x,
+                            stacked_y,
+                            segment_ids,
+                            freqs,
+                            optim_state,
+                            optim,
+                            grad_accum_steps,
+                            runtime_shardings,
+                        )
+                        loss = jax.block_until_ready(loss)
                         end = time.time()
                         dt = end - start
                         tokens_processed = bsz * seqlen * grad_accum_steps
                         tokens_per_sec = int(tokens_processed / dt)
-                        print(f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {avg_train_loss:8.4f} | Time taken: {dt:5.2f} s | Tokens processed/s: {tokens_per_sec:>9,}")
+                        print(
+                            f"Warmup step: [{step}/{profile_start_step}] | loss: {loss:8.4f} | Step time: {dt:5.2f} s | Tokens processed/s: {tokens_per_sec:>9,}"
+                        )
                         step += 1
-                    else:
-                        logdir = "/home/ubuntu/nanochat/jaxnano/final_checks/profile-data/"
-                        jax.profiler.start_trace(logdir)
+                        continue
 
-                        with jax.profiler.TraceAnnotation("host_stack"):
-                            for micro_step in range(grad_accum_steps):
-                                starts, ends = bf.next_batch(bsz, seqlen)
-                                get_next_batch(starts, ends, bsz, seqlen, tokens, data_accum_sharding,
-                                            transfer_to_device=False, out_tokens_u16=batch_tokens0[micro_step])
+                    profile_logdir.mkdir(parents=True, exist_ok=True)
+                    jax.profiler.start_trace(str(profile_logdir))
 
-                        with jax.profiler.TraceAnnotation("h2d"):
-                            stacked_tokens_cur = jax.device_put(batch_tokens0, data_accum_sharding)
-                            stacked_tokens_i32 = jax.lax.convert_element_type(stacked_tokens_cur, jnp.int32)
+                    stacked_x, stacked_y = prepare_step_batch(
+                        bf,
+                        tokens,
+                        batch_tokens0,
+                        bsz,
+                        seqlen,
+                        grad_accum_steps,
+                        data_accum_sharding,
+                    )
 
-                        for profile_step in range(profile_start_step, profile_end_step):
-                            with jax.profiler.StepTraceAnnotation("train", step_num=profile_step):
-                                # Launch compute for current step (cast + slice on device)
-                                with jax.profiler.TraceAnnotation("train_step_accum"):
-                                    stacked_x = stacked_tokens_i32[:, :, :-1]
-                                    stacked_y = stacked_tokens_i32[:, :, 1:]
-                                    model, loss, optim_state = train_step_accum(
-                                        model, stacked_x, stacked_y, freqs, optim_state, optim, grad_accum_steps
-                                    )
+                    for profile_step in range(profile_start_step, profile_end_step):
+                        with jax.profiler.StepTraceAnnotation("train", step_num=profile_step):
+                            with jax.profiler.TraceAnnotation("train_step_accum"):
+                                model, loss, optim_state = train_step_accum(
+                                    model,
+                                    stacked_x,
+                                    stacked_y,
+                                    segment_ids,
+                                    freqs,
+                                    optim_state,
+                                    optim,
+                                    grad_accum_steps,
+                                    runtime_shardings,
+                                )
 
-                                # While compute runs, prepare the next step on host
-                                with jax.profiler.TraceAnnotation("host_stack"):
-                                    for micro_step in range(grad_accum_steps):
-                                        starts, ends = bf.next_batch(bsz, seqlen)
-                                        get_next_batch(starts, ends, bsz, seqlen, tokens, data_accum_sharding,
-                                                    transfer_to_device=False, out_tokens_u16=batch_tokens1[micro_step])
+                            if profile_step + 1 < profile_end_step:
+                                next_x, next_y = prepare_step_batch(
+                                    bf,
+                                    tokens,
+                                    batch_tokens1,
+                                    bsz,
+                                    seqlen,
+                                    grad_accum_steps,
+                                    data_accum_sharding,
+                                )
+                            else:
+                                next_x, next_y = None, None
 
-                                # Queue the next H2D before we block on this step's loss
-                                with jax.profiler.TraceAnnotation("h2d"):
-                                    stacked_tokens_next = jax.device_put(batch_tokens1, data_accum_sharding)
+                            jax.block_until_ready(loss)
 
-                                # Synchronize for accurate timing after next H2D is queued
-                                jax.block_until_ready(loss)
-
-                                # Rotate buffers for the next iteration
+                            if next_x is not None:
                                 batch_tokens0, batch_tokens1 = batch_tokens1, batch_tokens0
-                                stacked_tokens_cur = stacked_tokens_next
-                        jax.profiler.stop_trace()
-                        profiling_complete = True
-                        break
+                                stacked_x, stacked_y = next_x, next_y
+
+                    jax.profiler.stop_trace()
+                    profiling_complete = True
+                    break
 
                 except StopIteration:
-                    # Once we have trained on one shard, let's validate the performance as well
-                    num_shards_used +=1
-                    print(f"\nShard exhuasted. Number of shards consumed till now: {num_shards_used}. Scoring model performance on vdalidation data...")
                     shard_processed_fully = True
-        finally:    
+                    num_shards_used += 1
+                    print("Shard exhausted")
+
+        finally:
             tokens.unlink_on_del()
+
+    train_end_time = time.time()
+    print(
+        f"\nTotal time taken for profiling run: {(train_end_time - train_start_time) / 60:.2f} minutes"
+    )
+
 
 if __name__ == "__main__":
     main()
