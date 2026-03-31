@@ -175,12 +175,8 @@ def main():
     print("\nNumber of train files found: ", num_train_files)
     print("Number of validation files found: ", num_val_files)
 
-    train_dl = make_grain_shard_loader(
-        train_files, prefetch=16, num_threads=32, prefetch_buffer_size=16
-    )
-    val_dl = make_grain_shard_loader(
-        val_files, prefetch=0, num_threads=16, prefetch_buffer_size=16
-    )
+    train_dl = make_grain_shard_loader(train_files)
+    val_dl = make_grain_shard_loader(val_files)
     train_iter = iter(train_dl)
 
     per_device_bsz = cfg.hparams.per_device_batch_size
