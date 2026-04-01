@@ -1,3 +1,4 @@
+import warnings
 import jax
 import jax.numpy as jnp
 import dataclasses
@@ -35,7 +36,7 @@ class EmbeddingConfig:
     d_emb: int = 768
     num_layers: int = 12
     weight_initializer: Callable = dataclasses.field(init=False)
-    weight_logical_axes: Tuple[str, str] = ("embed_in", "embed_out")
+    weight_logical_axes: Tuple[str, str] = ("vocab_out", "vocab_in")
 
     def __post_init__(self):
         self.weight_initializer = jax.nn.initializers.normal(stddev=1.0)
@@ -54,10 +55,10 @@ class MultiHeadAttentionConfig:
     wv_initializer: Callable = dataclasses.field(init=False)
     wo_initializer: Callable = dataclasses.field(init=False)
 
-    wq_logical_axes: Tuple[str, str] = ("attn_wq_in", "attn_wq_out")
-    wk_logical_axes: Tuple[str, str] = ("attn_wk_in", "attn_wk_out")
-    wv_logical_axes: Tuple[str, str] = ("attn_wv_in", "attn_wv_out")
-    wo_logical_axes: Tuple[str, str] = ("attn_wo_in", "attn_wo_out")
+    wq_logical_axes: Tuple[str, str] = ("qkv_embed", "q_heads")
+    wk_logical_axes: Tuple[str, str] = ("qkv_embed", "kv_heads")
+    wv_logical_axes: Tuple[str, str] = ("qkv_embed", "kv_heads")
+    wo_logical_axes: Tuple[str, str] = ("o_heads", "o_embed")
 
     def __post_init__(self):
         init = init_uniform(scale=3**0.5 * self.d_emb**-0.5)
@@ -81,10 +82,10 @@ class GroupedQueryAttentionConfig:
     wv_initializer: Callable = dataclasses.field(init=False)
     wo_initializer: Callable = dataclasses.field(init=False)
 
-    wq_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_q_heads", "attn_head_dim")
-    wk_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_kv_heads", "attn_head_dim")
-    wv_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_kv_heads", "attn_head_dim")
-    wo_logical_axes: Tuple[str, str, str] = ("attn_wo_in", "attn_head_dim", "attn_wo_out")
+    wq_logical_axes: Tuple[str, str, str] = ("qkv_embed", "q_heads", "head_dim")
+    wk_logical_axes: Tuple[str, str, str] = ("qkv_embed", "kv_heads", "head_dim")
+    wv_logical_axes: Tuple[str, str, str] = ("qkv_embed", "kv_heads", "head_dim")
+    wo_logical_axes: Tuple[str, str, str] = ("o_heads", "head_dim", "o_embed")
 
     def __post_init__(self):
         self.head_dim = self.d_emb // self.q_heads
@@ -117,14 +118,14 @@ class MLPConfig:
             in_features=self.d_emb,
             out_features=self.d_emb * 4,
             weight_initializer=init_uniform(scale=3**0.5 * self.d_emb**-0.5),
-            weight_logical_axes=("mlp_fc1_in", "mlp_fc1_out"),
+            weight_logical_axes=("mlp_up_embed", "mlp_up_ffw"),
         )
         self.fc2 = LinearConfig(
             dtype=self.dtype,
             in_features=self.d_emb * 4,
             out_features=self.d_emb,
             weight_initializer=jax.nn.initializers.zeros,
-            weight_logical_axes=("mlp_fc2_in", "mlp_fc2_out"),
+            weight_logical_axes=("mlp_down_ffw", "mlp_down_embed"),
         )
 
 
@@ -144,6 +145,17 @@ class ModelConfig:
     mlp: MLPConfig = dataclasses.field(init=False)
     lm_head: LinearConfig = dataclasses.field(init=False)
 
+    # Attention Pattern: Can be global, local (SWA), or a combo.
+    # Default is "L", meaning no SWA, and standard attention with RoPE is applied.
+    # If using a combo of local-global, it is advised to use it in a ratio of 3:1
+    # i.e. SSSL as first demosntrated by https://arxiv.org/abs/2501.18795
+    window_pattern: str = dataclasses.field(metadata=dict(static=True), default="L")
+    local_window_size: int = dataclasses.field(metadata=dict(static=True), default=None)
+
+    # Again consistent with literature that we apply NoPE only to global attention, in
+    # case it used with sliding window attention.
+    nope_global_attn: bool = dataclasses.field(metadata=dict(static=True), default=True)
+
     if attn_type == "mha":
         attn: MultiHeadAttentionConfig = dataclasses.field(init=False)
     elif attn_type == "gqa":
@@ -155,9 +167,20 @@ class ModelConfig:
 
     def __post_init__(self):
         if self.q_heads == self.kv_heads and self.attn_type == "gqa":
-            raise Warning(
+            raise ArithmeticError(
                 "When the number of query heads equals the number of kv heads, JAX computes MHA not GQA!"
             )
+
+        if self.local_window_size is not None and self.local_window_size >= self.seqlen:
+            warnings.warn(
+                "Window size for SWA cannot be greater than or equal to sequence length!"
+            )
+        elif self.window_pattern != "L" and self.local_window_size is None:
+            warnings.warn(
+                f"Looks like you want to use SWA, but did not pass window size. "
+                f"Setting `window_size = seqlen // 4 = `{self.seqlen // 4}"
+            )
+            self.local_window_size = self.seqlen // 4
 
         self.embed = EmbeddingConfig(
             dtype=self.dtype,
@@ -179,13 +202,14 @@ class ModelConfig:
                 d_emb=self.d_emb,
                 q_heads=self.q_heads,
                 kv_heads=self.kv_heads,
-                num_layers=self.num_layers
+                num_layers=self.num_layers,
             )
         self.mlp = MLPConfig(dtype=self.dtype, d_emb=self.d_emb)
         self.lm_head = LinearConfig(
             dtype=self.dtype,
             in_features=self.d_emb,
             out_features=self.vocab_size,
+            weight_logical_axes=("vocab_in", "vocab_out"),
             weight_initializer=jax.nn.initializers.normal(stddev=0.001),
         )
 
@@ -195,26 +219,30 @@ class ShardingRules:
     batch: AxisName = BATCH_AXIS_NAME
     sequence: AxisName = None
     act_embed: AxisName = None
+    act_ffw: AxisName = None
     act_heads: AxisName = None
+    head_dim: AxisName = None
 
-    embed_in: AxisName = None
-    embed_out: AxisName = None
+    # Vocab projection/logit axes.
+    vocab_in: AxisName = None
+    vocab_out: AxisName = None
 
-    attn_wqkv_in: AxisName = None
-    attn_q_heads: AxisName = None
-    attn_kv_heads: AxisName = None
-    attn_head_dim: AxisName = None
+    # Attention parameter axes.
+    qkv_embed: AxisName = None
+    q_heads: AxisName = None
+    kv_heads: AxisName = None
+    o_heads: AxisName = None
+    o_embed: AxisName = None
 
-    attn_wo_in: AxisName = None
-    attn_wo_out: AxisName = None
+    # MLP parameter axes.
+    mlp_up_embed: AxisName = None
+    mlp_up_ffw: AxisName = None
+    mlp_down_ffw: AxisName = None
+    mlp_down_embed: AxisName = None
 
+    # Reserved for future norm sharding.
     norm_in: AxisName = None
     norm_out: AxisName = None
-
-    mlp_fc1_in: AxisName = None
-    mlp_fc1_out: AxisName = None
-    mlp_fc2_in: AxisName = None
-    mlp_fc2_out: AxisName = None
 
     linear_in: AxisName = None
     linear_out: AxisName = None
@@ -257,11 +285,10 @@ class HyperParams:
     init_lr_frac: float = 0.2
     final_lr_frac: float = 0.0
 
-
     # Other
     es_patience: int = 500
     val_interval: int = 50
-    
+
 
 @jax_pytree_struct
 class Config:
@@ -271,4 +298,4 @@ class Config:
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     hparams: HyperParams = dataclasses.field(default_factory=HyperParams)
     ckpt_cfg: CheckpointConfig = dataclasses.field(default_factory=CheckpointConfig)
-    data_dir: Path | str = None
+    data_dir: Path | str = "fineweb10B/"
