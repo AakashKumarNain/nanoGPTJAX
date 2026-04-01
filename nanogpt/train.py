@@ -42,7 +42,7 @@ from jax.sharding import set_mesh
 from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward
-from utils import logical_to_sharding
+from utils import logical_to_sharding, jax_pytree_struct
 from optim import build_optimizer
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 from fineweb_dataloader import make_grain_shard_loader, BOSFinder
@@ -72,16 +72,18 @@ def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
 @partial(
     jax.jit,
     static_argnames=("optim", "grad_accum_steps"),
-    donate_argnums=(0, 1, 3, 4, 5),
+    donate_argnames=("params", "batch", "optim_state"),
 )
-def train_step_accum(
-    params, x_batch, y_batch, segment_ids, freqs, optim_state, optim, grad_accum_steps
-):
+def train_step_accum(params, batch, optim_state, optim, grad_accum_steps):
+    x_batch, y_batch = batch.x, batch.y
+    segment_ids, freqs = batch.segment_ids, batch.freqs
+    loss_mask = batch.loss_mask
+
     def body(carry, xy):
         param, opt_state, lsum = carry
         xb, yb = xy
         loss, grad = jax.value_and_grad(compute_loss)(
-            param, xb, yb, segment_ids, freqs, None
+            param, xb, yb, segment_ids, freqs, loss_mask
         )
 
         # MultiSteps accumulates grad internally and returns a zero-tree update on
@@ -98,10 +100,17 @@ def train_step_accum(
     return params, loss, optim_state
 
 
-@partial(jax.jit, static_argnames=("optim",), donate_argnums=(0, 1, 3, 4, 5))
-def train_step(params, x_batch, y_batch, segment_ids, freqs, optim_state, optim):
+@partial(
+    jax.jit,
+    static_argnames=("optim",),
+    donate_argnames=("params", "batch", "optim_state"),
+)
+def train_step(params, batch, optim_state, optim):
+    x_batch, y_batch = batch.x, batch.y
+    segment_ids, freqs = batch.segment_ids, batch.freqs
+    loss_mask = batch.loss_mask
     loss, grads = jax.value_and_grad(compute_loss)(
-        params, x_batch, y_batch, segment_ids, freqs
+        params, x_batch, y_batch, segment_ids, freqs, loss_mask
     )
     updates, optim_state = optim.update(grads, optim_state, params)
     updated_params = optax.apply_updates(params, updates)
@@ -109,8 +118,10 @@ def train_step(params, x_batch, y_batch, segment_ids, freqs, optim_state, optim)
 
 
 @jax.jit
-def val_step(params, x_batch, y_batch, segment_ids, freqs):
-    loss = compute_loss(params, x_batch, y_batch, segment_ids, freqs, None)
+def val_step(params, batch):
+    x_batch, y_batch = batch.x, batch.y
+    segment_ids, freqs = batch.segment_ids, batch.freqs
+    loss = compute_loss(params, x_batch, y_batch, segment_ids, freqs, batch.loss_mask)
     return loss
 
 
@@ -149,7 +160,7 @@ def get_next_batch(
 
     # If no new array was created
     if not create_new_buf:
-        return None
+        return
     else:
         if transfer_to_device:
             x = jax.device_put(buf_u16[:, :-1], data_sharding)
@@ -158,6 +169,29 @@ def get_next_batch(
             x = buf_u16[:, :-1]
             y = buf_u16[:, 1:]
         return x, y
+
+
+def model_run_name(cfg):
+    return (
+        f"{cfg.model.attn_type}"
+        f"_L{cfg.model.num_layers}"
+        f"_D{cfg.model.d_emb}"
+        f"_Q{cfg.model.q_heads}"
+        f"_KV{cfg.model.kv_heads}"
+        f"_H{cfg.model.attn.head_dim}"
+        f"_T{cfg.model.seqlen}"
+        f"_V{cfg.model.vocab_size}"
+        f"_{cfg.model.window_pattern}"
+    )
+
+
+@jax_pytree_struct
+class BatchData:
+    x: jax.Array
+    y: jax.Array
+    segment_ids: jax.Array
+    freqs: tuple
+    loss_mask: jax.Array = None
 
 
 def main():
@@ -184,9 +218,7 @@ def main():
     seqlen = cfg.model.seqlen
     head_dim = cfg.model.attn.head_dim
     data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
-    data_accum_sharding = logical_to_sharding(
-        (None, "batch", None), cfg.mesh, cfg.rules
-    )
+    data_accum_sharding = logical_to_sharding((None, "batch", None), cfg.mesh, cfg.rules)  # fmt: off
 
     max_lr = cfg.hparams.max_lr
     min_lr = 0.01 * max_lr
@@ -245,14 +277,24 @@ def main():
     print("")
     print("-" * 75)
     print("")
-
+    print(line("Run name", model_run_name(cfg), value_w=30))
+    print(line("Attention type", cfg.model.attn_type))
+    print(line("Attention Pattern", cfg.model.window_pattern))
+    print(line("Model dtype", str(cfg.model.dtype)))
+    print(line("Num layers", cfg.model.num_layers))
+    print(line("Embedding dim", cfg.model.d_emb))
+    print(line("Query heads", cfg.model.q_heads))
+    print(line("KV heads", cfg.model.kv_heads))
+    print(line("Head dim", cfg.model.attn.head_dim))
+    print(line("MLP hidden dim", cfg.model.mlp.fc1.out_features))
+    print(line("Vocab size", cfg.model.vocab_size))
     print(line("Number of trainable params: ", count_params(model), comma=True))
     print(line("Sequence length per sample", seqlen))
     print(line("Per device batch size", per_device_bsz))
     print(line("Total batch size", bsz))
     print(line("Grad accumulation steps", grad_accum_steps))
     print()
-    print(line("LR (min, max)", str((min_lr, max_lr))))
+    print(line("LR (min, max)", str((f"{min_lr:.6f}", f"{max_lr:.6f}"))))
     print(line("Warmup steps", cfg.hparams.warmup_steps))
     print(line("Weight decay", cfg.hparams.weight_decay), "\n")
     print("-" * 75)
@@ -292,7 +334,7 @@ def main():
     num_shards_used = 0
     total_tokens_consumed = 0
 
-    # Reusable data buffers
+    simple_batch = np.zeros((bsz, seqlen + 1), dtype=np.uint16)
     grad_accum_batch = np.zeros((grad_accum_steps, bsz, seqlen + 1), dtype=np.uint16)
     val_data_buf = np.zeros((bsz, seqlen + 1), dtype=np.uint16)
 
@@ -322,13 +364,47 @@ def main():
 
             # build the static index once per shard (on-demand)
             num_batches_in_shard = bf.build(bsz, seqlen)
-            print(f"\n=== Processing Shard: {num_shards_used} with name: {shard_name}", end=" | ")  # fmt: off
+            print(
+                f"\n=== Processing Shard: {num_shards_used} with name: {shard_name}",
+                end=" | ",
+            )
             print(f"Indexed {num_batches_in_shard} batches ===")
 
             while not shard_processed_fully:
                 try:
                     start = time.time()
-                    for micro_step in range(grad_accum_steps):
+                    if grad_accum_steps > 1:
+                        for micro_step in range(grad_accum_steps):
+                            starts, ends = bf.next_batch(bsz, seqlen)
+                            get_next_batch(
+                                starts,
+                                ends,
+                                bsz,
+                                seqlen,
+                                tokens,
+                                data_accum_sharding,
+                                grad_accum_batch[micro_step],
+                                transfer_to_device=False,
+                            )
+
+                        stacked_batch = jnp.asarray(
+                            grad_accum_batch,
+                            dtype=jnp.int32,
+                            device=data_accum_sharding,
+                        )
+                        stacked_x = stacked_batch[:, :, :-1]
+                        stacked_y = stacked_batch[:, :, 1:]
+                        batch_data = BatchData(
+                            x=stacked_x,
+                            y=stacked_y,
+                            freqs=freqs,
+                            segment_ids=segment_ids,
+                            loss_mask=None,
+                        )
+                        model, loss, optim_state = train_step_accum(
+                            model, batch_data, optim_state, optim, grad_accum_steps
+                        )
+                    else:
                         starts, ends = bf.next_batch(bsz, seqlen)
                         get_next_batch(
                             starts,
@@ -336,25 +412,25 @@ def main():
                             bsz,
                             seqlen,
                             tokens,
-                            data_accum_sharding,
-                            grad_accum_batch[micro_step],
+                            data_sharding,
+                            simple_batch,
                             transfer_to_device=False,
                         )
-                    stacked_batch = jnp.asarray(
-                        grad_accum_batch, dtype=jnp.int32, device=data_accum_sharding
-                    )
-                    stacked_x = stacked_batch[:, :, :-1]
-                    stacked_y = stacked_batch[:, :, 1:]
-                    model, loss, optim_state = train_step_accum(
-                        model,
-                        stacked_x,
-                        stacked_y,
-                        segment_ids,
-                        freqs,
-                        optim_state,
-                        optim,
-                        grad_accum_steps,
-                    )
+                        stacked_batch = jnp.asarray(
+                            simple_batch, dtype=jnp.int32, device=data_sharding
+                        )
+                        stacked_x = stacked_batch[:, :-1]
+                        stacked_y = stacked_batch[:, 1:]
+                        batch_data = BatchData(
+                            x=stacked_x,
+                            y=stacked_y,
+                            freqs=freqs,
+                            segment_ids=segment_ids,
+                            loss_mask=None,
+                        )
+                        model, loss, optim_state = train_step(
+                            model, batch_data, optim_state, optim
+                        )
 
                     # Block for accurate timing
                     jax.block_until_ready(loss)
@@ -364,7 +440,6 @@ def main():
                     tokens_processed = bsz * seqlen * grad_accum_steps
                     total_tokens_consumed += tokens_processed
                     tokens_per_sec = int(tokens_processed / dt)
-
                     # fmt: off
                     print(f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {loss:8.4f} | Step time: {dt:5.2f} s | Train time: {train_time_elapsed:6.2f} min | Tokens processed/s: {tokens_per_sec:>9,}")
                     # fmt: on
@@ -433,7 +508,14 @@ def main():
                                 )
                                 x = curr_val_data[:, :-1]
                                 y = curr_val_data[:, 1:]
-                                loss = val_step(model, x, y, segment_ids, freqs)
+                                batch_data = BatchData(
+                                    x=x,
+                                    y=y,
+                                    freqs=freqs,
+                                    segment_ids=segment_ids,
+                                    loss_mask=None,
+                                )
+                                loss = val_step(model, batch_data)
                                 val_loss += loss.item()
                                 val_steps_count += 1
                         finally:
@@ -449,11 +531,11 @@ def main():
                         es_patience_counter += 1
 
                     if es_patience_counter > es_patience:
-                         # fmt: off
+                        # fmt: off
                         print(f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps.")
                         print(f"Total number of shards consumed : {num_shards_used}")
                         print(f"Best loss                       : {best_loss:.4f} at step {best_step}")
-                         # fmt: on
+                        # fmt: on
                         mngr.wait_until_finished()
                         training_complete = True
                         break
@@ -465,9 +547,7 @@ def main():
         finally:
             tokens.unlink_on_del()
     train_end_time = time.time()
-    print(
-        f"\nTotal time taken to train the model: {(train_end_time - train_start_time) / 60:.2f} minutes"
-    )
+    print(f"\nTotal time taken to train the model: {(train_end_time - train_start_time)/60:.2f} minutes")  # fmt: off
 
 
 if __name__ == "__main__":
