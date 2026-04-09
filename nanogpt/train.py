@@ -42,7 +42,7 @@ from jax.sharding import set_mesh
 from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward
-from utils import logical_to_sharding, jax_pytree_struct
+from utils import logical_to_sharding
 from optim import build_optimizer
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 from fineweb_dataloader import make_grain_shard_loader, BOSFinder
@@ -72,13 +72,19 @@ def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
 @partial(
     jax.jit,
     static_argnames=("optim", "grad_accum_steps"),
-    donate_argnames=("params", "batch", "optim_state"),
+    donate_argnames=("params", "x_batch", "y_batch", "optim_state"),
 )
-def train_step_accum(params, batch, optim_state, optim, grad_accum_steps):
-    x_batch, y_batch = batch.x, batch.y
-    segment_ids, freqs = batch.segment_ids, batch.freqs
-    loss_mask = batch.loss_mask
-
+def train_step_accum(
+    params,
+    x_batch,
+    y_batch,
+    segment_ids,
+    freqs,
+    loss_mask,
+    optim_state,
+    optim,
+    grad_accum_steps,
+):
     def body(carry, xy):
         param, opt_state, lsum = carry
         xb, yb = xy
@@ -103,12 +109,11 @@ def train_step_accum(params, batch, optim_state, optim, grad_accum_steps):
 @partial(
     jax.jit,
     static_argnames=("optim",),
-    donate_argnames=("params", "batch", "optim_state"),
+    donate_argnames=("params", "x_batch", "y_batch", "optim_state"),
 )
-def train_step(params, batch, optim_state, optim):
-    x_batch, y_batch = batch.x, batch.y
-    segment_ids, freqs = batch.segment_ids, batch.freqs
-    loss_mask = batch.loss_mask
+def train_step(
+    params, x_batch, y_batch, segment_ids, freqs, loss_mask, optim_state, optim
+):
     loss, grads = jax.value_and_grad(compute_loss)(
         params, x_batch, y_batch, segment_ids, freqs, loss_mask
     )
@@ -118,10 +123,8 @@ def train_step(params, batch, optim_state, optim):
 
 
 @jax.jit
-def val_step(params, batch):
-    x_batch, y_batch = batch.x, batch.y
-    segment_ids, freqs = batch.segment_ids, batch.freqs
-    loss = compute_loss(params, x_batch, y_batch, segment_ids, freqs, batch.loss_mask)
+def val_step(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
+    loss = compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask)
     return loss
 
 
@@ -183,15 +186,6 @@ def model_run_name(cfg):
         f"_V{cfg.model.vocab_size}"
         f"_{cfg.model.window_pattern}"
     )
-
-
-@jax_pytree_struct
-class BatchData:
-    x: jax.Array
-    y: jax.Array
-    segment_ids: jax.Array
-    freqs: tuple
-    loss_mask: jax.Array = None
 
 
 def main():
@@ -394,15 +388,16 @@ def main():
                         )
                         stacked_x = stacked_batch[:, :, :-1]
                         stacked_y = stacked_batch[:, :, 1:]
-                        batch_data = BatchData(
-                            x=stacked_x,
-                            y=stacked_y,
-                            freqs=freqs,
-                            segment_ids=segment_ids,
-                            loss_mask=None,
-                        )
                         model, loss, optim_state = train_step_accum(
-                            model, batch_data, optim_state, optim, grad_accum_steps
+                            model,
+                            stacked_x,
+                            stacked_y,
+                            segment_ids,
+                            freqs,
+                            None,
+                            optim_state,
+                            optim,
+                            grad_accum_steps,
                         )
                     else:
                         starts, ends = bf.next_batch(bsz, seqlen)
@@ -416,20 +411,18 @@ def main():
                             simple_batch,
                             transfer_to_device=False,
                         )
-                        stacked_batch = jnp.asarray(
-                            simple_batch, dtype=jnp.int32, device=data_sharding
-                        )
+                        stacked_batch = jnp.asarray(simple_batch, dtype=jnp.int32, device=data_sharding)  # fmt: off
                         stacked_x = stacked_batch[:, :-1]
                         stacked_y = stacked_batch[:, 1:]
-                        batch_data = BatchData(
-                            x=stacked_x,
-                            y=stacked_y,
-                            freqs=freqs,
-                            segment_ids=segment_ids,
-                            loss_mask=None,
-                        )
                         model, loss, optim_state = train_step(
-                            model, batch_data, optim_state, optim
+                            model,
+                            stacked_x,
+                            stacked_y,
+                            segment_ids,
+                            freqs,
+                            None,
+                            optim_state,
+                            optim,
                         )
 
                     # Block for accurate timing
@@ -503,19 +496,10 @@ def main():
                                     val_data_buf,
                                 )
 
-                                curr_val_data = jnp.asarray(
-                                    val_data_buf, dtype=jnp.int32, device=data_sharding
-                                )
+                                curr_val_data = jnp.asarray(val_data_buf, dtype=jnp.int32, device=data_sharding)  # fmt: off
                                 x = curr_val_data[:, :-1]
                                 y = curr_val_data[:, 1:]
-                                batch_data = BatchData(
-                                    x=x,
-                                    y=y,
-                                    freqs=freqs,
-                                    segment_ids=segment_ids,
-                                    loss_mask=None,
-                                )
-                                loss = val_step(model, batch_data)
+                                loss = val_step(model, x, y, segment_ids, freqs, None)
                                 val_loss += loss.item()
                                 val_steps_count += 1
                         finally:
