@@ -448,3 +448,14 @@ if data_sharding is not None:
 return ds
 ```
 
+### KVCache improved
+
+We verified the new inference path by comparing three variants: the original no-cache forward(...), a no-cache explicit-
+mask reference, and the KV-cache inference path. The original path and the explicit-mask reference matched exactly,
+which confirmed that the local/global mask logic and RoPE/NoPE behavior are correct. The observed greedy decoding
+divergence came only from the full-buffer KV-cache path, and further debugging showed that it disappears when attention
+is run on a compact active-KV slice instead of the full backing buffer. This means the issue is not a cache indexing or
+masking bug, but a numerical effect: in bf16, attending over the full 2048-slot buffer with most entries masked out
+introduces enough extra flash-attention tiling/rescaling noise to break exact ties in logits and change greedy token
+selection. So the inference implementation is functionally correct, but exact greedy equivalence is only guaranteed with
+the compact active-KV path, not with the full-buffer masked cache path.
