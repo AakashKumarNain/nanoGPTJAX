@@ -5,7 +5,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-
 from kvcache import update_slice
 from kvcache import compute_segment_mask
 from kvcache import make_attention_mask
@@ -49,7 +48,9 @@ def compute_layer_configs(window_pattern, num_layers, short_window, nope_global=
     pattern = window_pattern.upper()
     for char in pattern:
         if char not in ("S", "L"):
-            raise ValueError(f"Invalid character '{char}' in window_pattern. Use 'S' or 'L'.")
+            raise ValueError(
+                f"Invalid character '{char}' in window_pattern. Use 'S' or 'L'."
+            )
 
     # "L" only: all full attention with RoPE
     if set(pattern) == {"L"}:
@@ -72,7 +73,7 @@ def compute_layer_configs(window_pattern, num_layers, short_window, nope_global=
             # Use global attention with Nope
             local_window_sizes.append(None)
             rope_flags.append(not nope_global)
-    
+
     # Irrespective of what the user passes, for stability, we always use
     # global attention for the last layer if a mixed pattern is passed.
     local_window_sizes[-1] = None
@@ -110,13 +111,14 @@ class TransformerBlock(ParamInitializer):
         return layer_repr(self)
 
 
-
 @jax_pytree_struct
 class GPT(ParamInitializer):
     embed: Embedding
     blocks: list[TransformerBlock]
     lm_head: Linear
-    local_window_sizes: tuple = dataclasses.field(metadata=dict(static=True), default=None)
+    local_window_sizes: tuple = dataclasses.field(
+        metadata=dict(static=True), default=None
+    )
     rope_flags: tuple = dataclasses.field(metadata=dict(static=True), default=None)
 
     @classmethod
@@ -144,6 +146,7 @@ class GPT(ParamInitializer):
 
     def __repr__(self):
         return layer_repr(self)
+
 
 def count_params(model):
     """Count the parameters in an Equinox model"""
@@ -177,7 +180,9 @@ def calculate_rope(x: jax.Array, sin: jax.Array, cos: jax.Array) -> jax.Array:
     orig_dtype = x.dtype
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     sin, cos = sin[:, :, None, :], cos[:, :, None, :]
-    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(orig_dtype)
+    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(
+        orig_dtype
+    )
 
 
 def embedding_forward(params, x):
@@ -266,7 +271,9 @@ def block_forward(params, x, mask, freqs, use_rope, local_window_size):
     with jax.named_scope("pre_attn_norm"):
         attn_in = rmsnorm_forward(x)
 
-    attn_out = attn_forward(params.attn, attn_in, mask, freqs, use_rope, local_window_size)
+    attn_out = attn_forward(
+        params.attn, attn_in, mask, freqs, use_rope, local_window_size
+    )
 
     with jax.named_scope("residual"):
         x = x + attn_out
@@ -294,7 +301,10 @@ def forward(params, x, segment_ids, freqs):
 
     for idx, block in enumerate(params.blocks):
         x = block_forward(
-            block, x, mask, freqs,
+            block,
+            x,
+            mask,
+            freqs,
             params.rope_flags[idx],
             params.local_window_sizes[idx],
         )
@@ -304,17 +314,27 @@ def forward(params, x, segment_ids, freqs):
 
     with jax.named_scope("unembed"):
         logits = linear_forward(params.lm_head, x)
-    
+
     with jax.named_scope("logit_soft_capping"):
         logits = logits.astype(jnp.float32)
         logits = 15.0 * jnp.tanh(logits / 15.0)
     return logits
 
 
-
 ############## Inference: with new simplified KVCache implementation ##############
 
-def attn_forward_infer(params, x, q_segment_ids, q_positions, freqs, cache, idx, use_rope, local_window_size):
+
+def attn_forward_infer(
+    params,
+    x,
+    q_segment_ids,
+    q_positions,
+    freqs,
+    cache,
+    idx,
+    use_rope,
+    local_window_size,
+):
     orig_dtype = x.dtype
     sin, cos = freqs
 
@@ -336,12 +356,18 @@ def attn_forward_infer(params, x, q_segment_ids, q_positions, freqs, cache, idx,
         write_pos = cache.next_write_index()
         chunk_len = jnp.asarray(x.shape[1], dtype=cache.end.dtype)
 
-        k_updated = update_slice(cache.k[idx], k, write_pos, update_axis=cache.time_axis)
-        v_updated = update_slice(cache.v[idx], v, write_pos, update_axis=cache.time_axis)
+        k_updated = update_slice(
+            cache.k[idx], k, write_pos, update_axis=cache.time_axis
+        )
+        v_updated = update_slice(
+            cache.v[idx], v, write_pos, update_axis=cache.time_axis
+        )
         cache_updates = (k_updated, v_updated)
 
         end_after_write = cache.end + chunk_len
-        kv_positions = cache.slot_positions(end=end_after_write) - cache.left_pad[:, None]
+        kv_positions = (
+            cache.slot_positions(end=end_after_write) - cache.left_pad[:, None]
+        )
         kv_segment_ids = cache.slot_segment_ids(end=end_after_write)
 
     with jax.named_scope("attention"):
@@ -369,7 +395,17 @@ def attn_forward_infer(params, x, q_segment_ids, q_positions, freqs, cache, idx,
     return out, cache_updates
 
 
-def block_forward_infer(params, x, q_segment_ids, q_positions, freqs, cache, idx, use_rope, local_window_size):
+def block_forward_infer(
+    params,
+    x,
+    q_segment_ids,
+    q_positions,
+    freqs,
+    cache,
+    idx,
+    use_rope,
+    local_window_size,
+):
     with jax.named_scope("pre_attn_norm"):
         attn_in = rmsnorm_forward(x)
 
