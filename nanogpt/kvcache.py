@@ -1,9 +1,16 @@
 """
-This implementation of KVCache has been adopted and modified from https://github.com/jax-ml/jax-llm-examples
-There are certain aspects of this implementation which the beginners may find unintuitive, especially the
-rolling buffer implementation.
+Cleaner rolling KV-cache for full-attention decode.
 
-TODO: Make it more intuitive to understand.
+This version keeps an absolute write cursor instead of mixing a wrapped cursor
+with per-row starts. The physical buffer is still circular, but the logical
+position math is explicit:
+
+- `end` is the next absolute position to write.
+- `left_pad` stores the number of left-pad tokens per batch row for prefill.
+- physical slot -> logical position mapping is derived on demand.
+
+The goal here is not a drop-in replacement for every current call site. The
+goal is a cache that is easier to reason about and safer to extend.
 """
 
 import dataclasses
@@ -12,22 +19,20 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-from jax.sharding import reshard, auto_axes
+from jax.sharding import auto_axes, reshard
 
-from utils import ParamSpec
 from utils import ParamInitializer
+from utils import ParamSpec
 from utils import jax_pytree_struct, layer_repr
 
 
 @jax_pytree_struct
 class KVCache(ParamInitializer):
-    k: list[jax.Array]  # (batch_size, kv_heads, max_seq_len, head_dim)
-    v: list[jax.Array]  # (batch_size, kv_heads, max_seq_len, head_dim)
-    # fmt: off
-    iter: jax.Array     # [] sequences are right-aligned for slice update performance
-    starts: jax.Array   # [batch_size]  sequences are right-aligned, we need start indices.
-     # fmt: off
-    time_axis: int = dataclasses.field(metadata=dict(static=True), default=2)
+    k: list[jax.Array]  # (batch_size, max_seq_len, kv_heads, head_dim)
+    v: list[jax.Array]  # (batch_size, max_seq_len, kv_heads, head_dim)
+    end: jax.Array  # [] absolute next write position
+    left_pad: jax.Array  # [batch_size] count of left-pad tokens used at prefill
+    time_axis: int = dataclasses.field(metadata=dict(static=True), default=1)
     size: int = dataclasses.field(metadata=dict(static=True), default=-1)
 
     @classmethod
@@ -35,46 +40,118 @@ class KVCache(ParamInitializer):
         cache_spec = ParamSpec(
             shape=(
                 batch_size,
-                cfg.model.attn.kv_heads,
                 cfg.model.seqlen,
+                cfg.model.attn.kv_heads,
                 cfg.model.attn.head_dim,
             ),
             dtype=cfg.model.dtype,
-            logical_axes=("batch", "attn_kv_heads", "sequence", "attn_head_dim"),
+            logical_axes=("batch", "sequence", "kv_heads", "head_dim"),
             initializer=jax.nn.initializers.zeros,
         )
-        iter = ParamSpec(
+        end = ParamSpec(
             shape=(),
             dtype=jnp.int32,
             logical_axes=(),
-            initializer=jax.nn.initializers.constant(-1),
+            initializer=jax.nn.initializers.zeros,
         )
-        starts = ParamSpec(
+        left_pad = ParamSpec(
             shape=(batch_size,),
             dtype=jnp.int32,
             logical_axes=("batch",),
             initializer=jax.nn.initializers.zeros,
         )
 
-        cache = KVCache(
+        return KVCache(
             k=[cache_spec for _ in range(cfg.model.num_layers)],
             v=[cache_spec for _ in range(cfg.model.num_layers)],
-            iter=iter,
-            starts=starts,
+            end=end,
+            left_pad=left_pad,
             size=cfg.model.seqlen,
         )
-        return cache
 
-    def fill_len(self) -> jax.Array:
-        return jnp.where(self.iter >= 0, (self.iter - self.starts) % self.size, 0)
+    @classmethod
+    def init(cls, key, mesh, rules, batch_size, cfg):
+        return cls._init_fn(key, mesh, rules, batch_size, cfg)
 
     @property
     def buffers(self):
         return (self.k, self.v)
 
-    @classmethod
-    def init(cls, key, mesh, rules, batch_size, cfg):
-        return cls._init_fn(key, mesh, rules, batch_size, cfg)
+    @property
+    def batch_size(self) -> int:
+        return self.left_pad.shape[0]
+
+    def next_write_index(self, end=None) -> jax.Array:
+        end = self.end if end is None else jnp.asarray(end, dtype=self.end.dtype)
+        return jnp.mod(end, self.size)
+
+    def oldest_cached_position(self, end=None) -> jax.Array:
+        end = self.end if end is None else jnp.asarray(end, dtype=self.end.dtype)
+        return jnp.maximum(end - self.size, 0)
+
+    def fill_len(self, end=None) -> jax.Array:
+        end = self.end if end is None else jnp.asarray(end, dtype=self.end.dtype)
+        return jnp.clip(end - self.left_pad, 0, self.size)
+
+    def is_full(self, end=None) -> jax.Array:
+        end = self.end if end is None else jnp.asarray(end, dtype=self.end.dtype)
+        return end >= self.size
+
+    def with_left_padding(self, left_pad: jax.Array):
+        left_pad = jnp.asarray(left_pad, dtype=self.left_pad.dtype)
+        return dataclasses.replace(
+            self, left_pad=left_pad, end=jnp.zeros_like(self.end)
+        )
+
+    def advance(self, token_count):
+        token_count = jnp.asarray(token_count, dtype=self.end.dtype)
+        return dataclasses.replace(self, end=self.end + token_count)
+
+    def slot_positions(self, end=None) -> jax.Array:
+        """Absolute position represented by each physical slot.
+
+        Returns:
+            Array of shape [batch_size, size]. Absolute positions are identical
+            across batch rows; validity still depends on `left_pad`.
+        """
+        end = self.end if end is None else jnp.asarray(end, dtype=self.end.dtype)
+        slots = jnp.arange(self.size, dtype=self.end.dtype)
+        oldest = self.oldest_cached_position(end=end)
+        next_write = self.next_write_index(end=end)
+
+        wrapped_positions = oldest + jnp.mod(slots - next_write, self.size)
+        unwrapped_positions = slots
+        positions = jnp.where(end > self.size, wrapped_positions, unwrapped_positions)
+        return jnp.broadcast_to(positions[None, :], (self.batch_size, self.size))
+
+    def slot_segment_ids(self, end=None) -> jax.Array:
+        """Binary validity mask for cached KV slots, shape [batch_size, size]."""
+        end = self.end if end is None else jnp.asarray(end, dtype=self.end.dtype)
+        slot_positions = self.slot_positions(end=end)
+        valid = (slot_positions >= self.left_pad[:, None]) & (slot_positions < end)
+        return valid.astype(jnp.int32)
+
+    def query_positions(self, q_len: int, start=None) -> jax.Array:
+        """Absolute positions for the current query chunk, shape [batch_size, q_len]."""
+        start = self.end if start is None else jnp.asarray(start, dtype=self.end.dtype)
+        positions = start + jnp.arange(q_len, dtype=self.end.dtype)
+        return jnp.broadcast_to(positions[None, :], (self.batch_size, q_len))
+
+    def attention_metadata(self, segment_ids: jax.Array):
+        """Metadata needed to build an attention mask after staging a write.
+
+        The returned key/value positions and valid KV mask assume the current
+        query chunk has already been written into the rolling buffer, while the
+        query positions still correspond to the chunk's original absolute
+        positions.
+        """
+        appended_tokens = jnp.max(length_minus_right_padding(segment_ids))
+        q_segment_ids = jnp.where(segment_ids != 0, 1, 0).astype(jnp.int32)
+        q_positions = self.query_positions(segment_ids.shape[1], start=self.end)
+        end_after_write = self.end + appended_tokens
+        kv_positions = self.slot_positions(end=end_after_write)
+        kv_segment_ids = self.slot_segment_ids(end=end_after_write)
+        return q_positions, kv_positions, q_segment_ids, kv_segment_ids, appended_tokens
 
     def __repr__(self):
         return layer_repr(self)
@@ -85,21 +162,58 @@ def update_slice(x: jax.Array, y: jax.Array, pos: int, update_axis: int):
     return jax.lax.dynamic_update_slice_in_dim(x, y, pos, axis=update_axis)
 
 
+def compute_segment_mask(segment_ids):
+    """Compute once, reuse across all layers. Returns (B, 1, T, S) bias or None."""
+    if segment_ids is None:
+        return None
+
+    # (B, T) valid token positions (segment_id != 0)
+    valid_segment_ids = jnp.where(segment_ids != 0, 1, 0)
+
+    # (B, T, T) same segment
+    same_segment = jnp.equal(segment_ids[:, :, None], segment_ids[:, None, :])
+
+    # (B, T, T) valid on both query and key axes
+    valid = valid_segment_ids[:, :, None] & valid_segment_ids[:, None, :]
+
+    mask = (same_segment & valid).astype(jnp.bool)
+    return mask[:, None, :, :]  # (B, 1, T, T)
+
+
 def make_attention_mask(
-    q_len, k_len, q_segment_ids, kv_segment_ids, q_offset, kv_offset, causal: bool
+    q_segment_ids: jax.Array,
+    kv_segment_ids: jax.Array,
+    q_positions: jax.Array,
+    kv_positions: jax.Array,
+    causal: bool,
+    local_window_size=None,
 ):
+    """Build an attention mask from explicit logical positions.
+
+    Args:
+        q_segment_ids: [B, T] binary or segment ids for query tokens.
+        kv_segment_ids: [B, S] binary or segment ids for KV tokens.
+        q_positions: [B, T] logical positions of query tokens.
+        kv_positions: [B, S] logical positions of KV tokens.
+        causal: Whether to enforce causal masking.
+        local_window_size: Optional int or (left, right) tuple. For causal
+            decode we only use the left window and restrict attention to keys
+            within that many positions behind each query.
+    """
     segment_mask = (q_segment_ids[:, :, None] == kv_segment_ids[:, None, :])[
         :, None, :, :
-    ]  # [B, 1, t, T]
+    ]
     if causal:
-        qk = (1, 1, q_len, k_len)  # [b, h, t, T]
-        q_positions = (
-            jax.lax.broadcasted_iota(jnp.int32, qk, 2) + q_offset[:, None, None, None]
-        )
-        kv_positions = (
-            jax.lax.broadcasted_iota(jnp.int32, qk, 3) + kv_offset[:, None, None, None]
-        ) % k_len
-        causal_mask = q_positions >= kv_positions
+        causal_mask = q_positions[:, None, :, None] >= kv_positions[:, None, None, :]
+        if local_window_size is not None:
+            if isinstance(local_window_size, int):
+                left_window = local_window_size
+            else:
+                left_window = local_window_size[0]
+            window_mask = (
+                q_positions[:, None, :, None] - kv_positions[:, None, None, :]
+            ) <= left_window
+            causal_mask = causal_mask & window_mask
         return segment_mask & causal_mask
     return segment_mask
 
