@@ -1,24 +1,21 @@
 import os
-
 # Set some GPU FLAGS
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-os.environ["NCCL_NVLS_ENABLE"] = "1"
-os.environ.update(
-    {
-        "NCCL_LL128_BUFFSIZE": "-2",
-        "NCCL_LL_BUFFSIZE": "-2",
-        "NCCL_PROTO": "SIMPLE,LL,LL128",
-    }
-)
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_triton_gemm_any=True "
-    "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_enable_pipelined_all_reduce=true "
-    "--xla_gpu_enable_pipelined_all_gather=true "
-    "--xla_gpu_enable_pipelined_reduce_scatter=true "
-    "--xla_gpu_enable_while_loop_double_buffering=true "
-    "--xla_gpu_enable_pipelined_p2p=true "
-    "--xla_gpu_collective_permute_decomposer_threshold=1024 "
+os.environ["NCCL_NVLS_ENABLE"]="1"
+os.environ.update({
+  "NCCL_LL128_BUFFSIZE": "-2",
+  "NCCL_LL_BUFFSIZE": "-2",
+   "NCCL_PROTO": "SIMPLE,LL,LL128",
+ })
+os.environ['XLA_FLAGS'] = (
+    '--xla_gpu_triton_gemm_any=True '
+    '--xla_gpu_enable_latency_hiding_scheduler=true '
+    '--xla_gpu_enable_pipelined_all_reduce=true '
+    '--xla_gpu_enable_pipelined_all_gather=true '
+    '--xla_gpu_enable_pipelined_reduce_scatter=true '
+    '--xla_gpu_enable_while_loop_double_buffering=true '
+    '--xla_gpu_enable_pipelined_p2p=true '
+    '--xla_gpu_collective_permute_decomposer_threshold=1024 '
 )
 import warnings
 import logging
@@ -27,7 +24,6 @@ from pathlib import Path
 from functools import partial
 
 import jax
-
 jax.config.update("jax_optimization_level", "O1")
 
 import optax
@@ -42,10 +38,12 @@ from jax.sharding import set_mesh
 from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward
-from utils import logical_to_sharding
+from utils import logical_to_sharding, jax_pytree_struct
 from optim import build_optimizer
 from config import ShardingRules, Config, BATCH_AXIS_NAME
+
 from fineweb_dataloader import make_grain_shard_loader, BOSFinder
+from custom_loss import chunked_softmax_cross_entropy_with_integer_labels
 
 
 logging.getLogger("absl").setLevel(logging.ERROR)
@@ -188,6 +186,7 @@ def model_run_name(cfg):
     )
 
 
+
 def main():
     # Get the mesh, sharding rules, amd the config
     devices = np.array(jax.devices())
@@ -252,21 +251,6 @@ def main():
 
     optim_state = optim.init(model)
 
-    # Checkpointing
-    ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir)
-    options = ocp.CheckpointManagerOptions(
-        max_to_keep=max_checkpoints_to_keep,
-        save_interval_steps=checkpoint_save_steps,
-        enable_async_checkpointing=True,
-        enable_background_delete=True,
-    )
-    handlers = {
-        "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
-        "optim_state": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
-        "ds": ocp.Checkpointer(grain.checkpoint.CheckpointHandler()),
-    }
-
-    mngr = ocp.CheckpointManager(ckpt_path, handlers, options=options)
 
     print("")
     print("-" * 75)
@@ -293,6 +277,23 @@ def main():
     print(line("Weight decay", cfg.hparams.weight_decay), "\n")
     print("-" * 75)
 
+
+    # Checkpointing
+    ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir) / model_run_name(cfg)
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=max_checkpoints_to_keep,
+        save_interval_steps=checkpoint_save_steps,
+        enable_async_checkpointing=True,
+        enable_background_delete=True,
+    )
+    handlers = {
+        "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
+        "optim_state": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
+        "ds": ocp.Checkpointer(grain.checkpoint.CheckpointHandler()),
+    }
+
+    mngr = ocp.CheckpointManager(ckpt_path, handlers, options=options)
+
     # Compute the frequencies
     positions = jnp.arange(seqlen)[None, :]
     with set_mesh(cfg.mesh):
@@ -316,9 +317,7 @@ def main():
             )
         else:
             resume_from_step = 0
-            print(
-                f"Checkpoint path {resume_ckpt_path} not found! Resuming training without restoring checkpoint..."
-            )
+            print(f"Checkpoint path {resume_ckpt_path} not found! Resuming training without restoring checkpoint...")
 
     best_loss = float("inf")
     last_val_loss = float("inf")
