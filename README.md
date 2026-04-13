@@ -29,14 +29,14 @@ The models here can be trained with both `AdamW` and `Muon` optimizers (via Opta
 
 - [x] Minimal abstraction for defining layers and models
 - [x] Pretrain a GPT-2-like model on FineWeb 10B tokens
-- [x] Inference
+- [x] Inference and KVCache
 - [x] Cautious Weight Decay
 - [x] Chunked Cross Entropy
 - [x] Mid-training
 - [x] Supervised fine-tuning on a dataset
+- [x] RoPE-NoPE (local-global attention) pattern
 - [ ] Reinforcement learning on a dataset
 - [ ] Speculative Decoding
-- [ ] Leaderboard to track run time for convergence wrt tricks
 - [ ] Quantization
 - [ ] MoE example
 
