@@ -38,12 +38,12 @@ from jax.sharding import set_mesh
 from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward
-from utils import logical_to_sharding, jax_pytree_struct
+from utils import logical_to_sharding
 from optim import build_optimizer
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 
 from fineweb_dataloader import make_grain_shard_loader, BOSFinder
-from custom_loss import chunked_softmax_cross_entropy_with_integer_labels
+# from custom_loss import chunked_softmax_cross_entropy_with_integer_labels
 
 
 logging.getLogger("absl").setLevel(logging.ERROR)
