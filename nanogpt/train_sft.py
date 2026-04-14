@@ -1,6 +1,7 @@
 import os
-
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # Set some GPU FLAGS
+
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 os.environ["NCCL_NVLS_ENABLE"] = "1"
 os.environ.update(
@@ -23,7 +24,6 @@ os.environ["XLA_FLAGS"] = (
 import warnings
 import logging
 import time
-from pathlib import Path
 from functools import partial
 
 import jax
@@ -31,7 +31,6 @@ import jax
 jax.config.update("jax_optimization_level", "O1")
 
 import optax
-import grain
 import numpy as np
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
@@ -50,7 +49,6 @@ logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
 
 
-# For RoPE frequency calculations
 jitted_precompute_frequencies = jax.jit(
     precompute_frequencies, static_argnames=("features", "theta", "dtype")
 )
@@ -76,7 +74,7 @@ def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
 @partial(
     jax.jit,
     static_argnames=("optim", "grad_accum_steps"),
-    donate_argnums=(0, 1, 3, 4, 5, 7),
+    donate_argnames=("params", "x_batch", "y_batch", "optim_state"),
 )
 def train_step_accum(
     params,
@@ -84,9 +82,9 @@ def train_step_accum(
     y_batch,
     segment_ids,
     freqs,
+    loss_mask,
     optim_state,
     optim,
-    loss_mask,
     grad_accum_steps,
 ):
     def body(carry, xy):
@@ -110,9 +108,13 @@ def train_step_accum(
     return params, loss, optim_state
 
 
-@partial(jax.jit, static_argnames=("optim",), donate_argnums=(0, 1, 3, 4, 5))
+@partial(
+    jax.jit,
+    static_argnames=("optim",),
+    donate_argnames=("params", "x_batch", "y_batch", "optim_state"),
+)
 def train_step(
-    params, x_batch, y_batch, segment_ids, freqs, optim_state, optim, loss_mask
+    params, x_batch, y_batch, segment_ids, freqs, loss_mask, optim_state, optim
 ):
     loss, grads = jax.value_and_grad(compute_loss)(
         params, x_batch, y_batch, segment_ids, freqs, loss_mask
@@ -133,6 +135,20 @@ def line(label, value, comma=False, label_w=30, colon_w=2, value_w=20):
     return f"{label:<{label_w}}{':':<{colon_w}}{value:{fmt}}"
 
 
+def model_run_name(cfg):
+    return (
+        f"{cfg.model.attn_type}"
+        f"_L{cfg.model.num_layers}"
+        f"_D{cfg.model.d_emb}"
+        f"_Q{cfg.model.q_heads}"
+        f"_KV{cfg.model.kv_heads}"
+        f"_H{cfg.model.attn.head_dim}"
+        f"_T{cfg.model.seqlen}"
+        f"_V{cfg.model.vocab_size}"
+        f"_{cfg.model.window_pattern}"
+    )
+
+
 def main():
     # Get the mesh, sharding rules, amd the config
     devices = np.array(jax.devices())
@@ -146,16 +162,9 @@ def main():
     seqlen = cfg.model.seqlen
     head_dim = cfg.model.attn.head_dim
     data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
-    data_accum_sharding = logical_to_sharding(
-        (None, "batch", None), cfg.mesh, cfg.rules
-    )
-
     max_lr = cfg.hparams.max_lr
     min_lr = 0.01 * max_lr
-    warmup_steps = cfg.hparams.warmup_steps
-    desired_batch_size = cfg.hparams.desired_batch_size
     grad_accum_steps = 1
-
     total_train_steps = cfg.hparams.total_train_steps
     max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
     checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
@@ -201,7 +210,6 @@ def main():
     # Optimizer
     optim = optax.chain(
         optax.clip_by_global_norm(cfg.hparams.grad_clip_norm),
-        # TODO: Replace it. This was used just for testing
         optax.adamw(learning_rate=1e-4),
     )
     optim_state = optim.init(model)
@@ -223,14 +231,24 @@ def main():
     print("")
     print("-" * 75)
     print("")
-
+    print(line("Run name", model_run_name(cfg), value_w=30))
+    print(line("Attention type", cfg.model.attn_type))
+    print(line("Attention Pattern", cfg.model.window_pattern))
+    print(line("Model dtype", str(cfg.model.dtype)))
+    print(line("Num layers", cfg.model.num_layers))
+    print(line("Embedding dim", cfg.model.d_emb))
+    print(line("Query heads", cfg.model.q_heads))
+    print(line("KV heads", cfg.model.kv_heads))
+    print(line("Head dim", cfg.model.attn.head_dim))
+    print(line("MLP hidden dim", cfg.model.mlp.fc1.out_features))
+    print(line("Vocab size", cfg.model.vocab_size))
     print(line("Number of trainable params: ", count_params(model), comma=True))
     print(line("Sequence length per sample", seqlen))
     print(line("Per device batch size", per_device_bsz))
     print(line("Total batch size", bsz))
     print(line("Grad accumulation steps", grad_accum_steps))
     print()
-    print(line("LR (min, max)", str((min_lr, max_lr))))
+    print(line("LR (min, max)", str((f"{min_lr:.6f}", f"{max_lr:.6f}"))))
     print(line("Warmup steps", cfg.hparams.warmup_steps))
     print(line("Weight decay", cfg.hparams.weight_decay), "\n")
     print("-" * 75)
@@ -262,7 +280,7 @@ def main():
             freqs = jitted_precompute_frequencies(positions, head_dim)
 
         model, loss, optim_state = train_step(
-            model, x, y, segment_ids, freqs, optim_state, optim, completion_mask
+            model, x, y, segment_ids, freqs, completion_mask, optim_state, optim
         )
         loss = jax.block_until_ready(loss).item()
         end = time.time()
@@ -274,9 +292,7 @@ def main():
         total_tokens_consumed += tokens_processed
         tokens_per_sec = int(tokens_processed / dt)
 
-        print(
-            f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {loss:8.4f} | Step time: {dt:5.2f} s | Train time: {train_time_elapsed:6.2f} min | Tokens processed/s: {tokens_per_sec:>9,}"
-        )
+        print(f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {loss:8.4f} | Step time: {dt:5.2f} s | Train time: {train_time_elapsed:6.2f} min | Tokens processed/s: {tokens_per_sec:>9,}")  # fmt: off
 
         if (step % options.save_interval_steps) == 0:
             mngr.save(
@@ -316,16 +332,14 @@ def main():
                 es_patience_counter += 1
 
             if es_patience_counter > es_patience:
-                print(
-                    f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps."
-                )
+                # fmt: off
+                print(f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps.")
                 print(f"Total number of shards consumed : {num_shards_used}")
-                print(
-                    f"Best loss                       : {best_loss:.4f} at step {best_step}"
-                )
+                print(f"Best loss                       : {best_loss:.4f} at step {best_step}")
                 mngr.wait_until_finished()
                 training_complete = True
                 break
+                # fmt: on
 
             print(f"last_val_loss : {last_val_loss:.4f}")
             print(f"curr_val_loss : {avg_val_loss:.4f}")
