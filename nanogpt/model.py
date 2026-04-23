@@ -14,6 +14,7 @@ from utils import layer_repr
 from utils import ParamInitializer
 from utils import jax_pytree_struct
 from layers import Embedding, Linear, GroupedQueryAttention
+from quantization import QArray, maybe_dequantize
 
 
 if jax.default_backend() == "gpu":
@@ -150,7 +151,21 @@ class GPT(ParamInitializer):
 
 def count_params(model):
     """Count the parameters in an Equinox model"""
-    return sum(x.size for x in jax.tree_util.tree_leaves(model))
+    leaves = jax.tree_util.tree_leaves(
+        model, is_leaf=lambda x: x is None or isinstance(x, QArray)
+    )
+    total = 0
+    for leaf in leaves:
+        if leaf is None:
+            continue
+        if isinstance(leaf, QArray):
+            if hasattr(leaf.qvalue, "size"):
+                total += leaf.qvalue.size
+            else:
+                total += math.prod(leaf.qvalue.shape)
+        else:
+            total += leaf.size
+    return total
 
 
 def precompute_frequencies(
@@ -186,7 +201,8 @@ def calculate_rope(x: jax.Array, sin: jax.Array, cos: jax.Array) -> jax.Array:
 
 
 def embedding_forward(params, x):
-    return params.weight.at[x, :].get()
+    weight = maybe_dequantize(params.weight)
+    return weight.at[x, :].get()
 
 
 def rmsnorm_forward(x, eps=1e-5):
@@ -197,7 +213,8 @@ def rmsnorm_forward(x, eps=1e-5):
 
 
 def linear_forward(params, x):
-    out = jnp.einsum("...d, dv-> ...v", x, params.weight)
+    weight = maybe_dequantize(params.weight)
+    out = jnp.einsum("...d, dv-> ...v", x, weight)
     if params.bias is not None:
         return out + params.bias
     else:
@@ -225,9 +242,12 @@ def attn_forward(params, x, mask, freqs, use_rope, local_window_size):
     sin, cos = freqs
 
     with jax.named_scope("qkv_matmul"):
-        q = jnp.einsum("btd, dhq -> bthq", x, params.wq)
-        k = jnp.einsum("btd, dhq -> bthq", x, params.wk)
-        v = jnp.einsum("btd, dhq -> bthq", x, params.wv)
+        wq = maybe_dequantize(params.wq)
+        wk = maybe_dequantize(params.wk)
+        wv = maybe_dequantize(params.wv)
+        q = jnp.einsum("btd, dhq -> bthq", x, wq)
+        k = jnp.einsum("btd, dhq -> bthq", x, wk)
+        v = jnp.einsum("btd, dhq -> bthq", x, wv)
 
     with jax.named_scope("qk_norm"):
         q = rmsnorm_forward(q)
@@ -263,7 +283,8 @@ def attn_forward(params, x, mask, freqs, use_rope, local_window_size):
             ).astype(orig_dtype)
 
     with jax.named_scope("projection"):
-        out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
+        wo = maybe_dequantize(params.wo)
+        out = jnp.einsum("bthq, hqd->btd", attn, wo)
     return out
 
 
@@ -339,9 +360,12 @@ def attn_forward_infer(
     sin, cos = freqs
 
     with jax.named_scope("qkv_matmul"):
-        q = jnp.einsum("btd, dhq -> bthq", x, params.wq)
-        k = jnp.einsum("btd, dhq -> bthq", x, params.wk)
-        v = jnp.einsum("btd, dhq -> bthq", x, params.wv)
+        wq = maybe_dequantize(params.wq)
+        wk = maybe_dequantize(params.wk)
+        wv = maybe_dequantize(params.wv)
+        q = jnp.einsum("btd, dhq -> bthq", x, wq)
+        k = jnp.einsum("btd, dhq -> bthq", x, wk)
+        v = jnp.einsum("btd, dhq -> bthq", x, wv)
 
     with jax.named_scope("qk_norm"):
         q = rmsnorm_forward(q)
@@ -391,7 +415,8 @@ def attn_forward_infer(
         ).astype(orig_dtype)
 
     with jax.named_scope("projection"):
-        out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
+        wo = maybe_dequantize(params.wo)
+        out = jnp.einsum("bthq, hqd->btd", attn, wo)
     return out, cache_updates
 
 
