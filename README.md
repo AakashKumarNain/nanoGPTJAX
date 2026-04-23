@@ -35,6 +35,7 @@ The models here can be trained with both `AdamW` and `Muon` optimizers (via Opta
 - [x] Mid-training
 - [x] Supervised fine-tuning on a dataset
 - [x] RoPE-NoPE (local-global attention) pattern
+- [x] Post Training Quantization (Weights only int8 quantization for now)
 - [ ] Reinforcement learning on a dataset
 - [ ] Speculative Decoding
 - [ ] Quantization
