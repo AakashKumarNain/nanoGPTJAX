@@ -45,23 +45,54 @@ def path_to_string(path):
 
 @jax_pytree_struct
 class QArray:
-    qvalue: jax.Array | ParamSpec
+    """Quantized tensor leaf with scale metadata.
+
+    `quantized_value` stores the packed integer tensor. `scale` stores the
+    dequantization scale after removing `reduction_axes` from the original
+    tensor shape. For the weight-only PTQ path in this repo, those axes are the
+    dimensions reduced by the model contractions, so scales usually correspond
+    to output channels and can be applied after the dot/einsum.
+
+    `scale_applied_to_output` and `scale_expand_dims` describe how the generic
+    `einsum` wrapper should place the scale. They are execution hints, not part
+    of the integer payload.
+    """
+
+    quantized_value: jax.Array | ParamSpec
     scale: jax.Array | ParamSpec
-    axis: tuple[int, ...] = dataclasses.field(default=(), metadata=dict(static=True))
-    bits: int = dataclasses.field(default=8, metadata=dict(static=True))
+    reduction_axes: tuple[int, ...] = dataclasses.field(
+        default=(), metadata=dict(static=True)
+    )
+    scale_applied_to_output: bool = dataclasses.field(
+        default=True, metadata=dict(static=True)
+    )
+    scale_expand_dims: int | tuple[int, ...] = dataclasses.field(
+        default=(), metadata=dict(static=True)
+    )
+    num_bits: int = dataclasses.field(default=8, metadata=dict(static=True))
     symmetric: bool = dataclasses.field(default=True, metadata=dict(static=True))
-    original_dtype: jnp.dtype = dataclasses.field(
+    dequantized_dtype: jnp.dtype = dataclasses.field(
         default=jnp.bfloat16, metadata=dict(static=True)
     )
     scale_dtype: jnp.dtype = dataclasses.field(
         default=jnp.bfloat16, metadata=dict(static=True)
     )
 
+    @property
+    def shape(self):
+        return self.quantized_value.shape
+
+    @property
+    def ndim(self):
+        return len(self.quantized_value.shape)
+
 
 @dataclasses.dataclass(frozen=True)
 class QuantizationRule:
     pattern: str
     axis: int | tuple[int, ...] | None = None
+    scale_applied_to_output: bool = True
+    scale_expand_dims: int | tuple[int, ...] = ()
     bits: int = 8
     symmetric: bool = True
     scale_dtype: jnp.dtype = jnp.bfloat16
@@ -91,9 +122,13 @@ def quantize(
     axis: int | tuple[int, ...],
     scale_dtype=jnp.bfloat16,
     zero_init: bool = False,
+    scale_applied_to_output: bool = True,
+    scale_expand_dims: int | tuple[int, ...] = (),
     bits: int = 8,
     symmetric: bool = True,
 ):
+    """Quantize an array or spec over the given reduction axis/axes."""
+
     if isinstance(x, QArray):
         raise ValueError("Attempting to quantize an already quantized QArray.")
     if bits != 8:
@@ -113,17 +148,21 @@ def quantize(
         scale = jnp.maximum(amax / 127.0, jnp.finfo(scale_dtype).tiny).astype(
             scale_dtype
         )
-        qvalue = jnp.clip(jnp.rint(x_for_quant / scale), -127, 127).astype(jnp.int8)
+        quantized_value = jnp.clip(jnp.rint(x_for_quant / scale), -127, 127).astype(
+            jnp.int8
+        )
         scale = scale.reshape(
             [dim for i, dim in enumerate(scale.shape) if i not in axis]
         )
         return QArray(
-            qvalue=qvalue,
+            quantized_value=quantized_value,
             scale=scale,
-            axis=axis,
-            bits=bits,
+            reduction_axes=axis,
+            scale_applied_to_output=scale_applied_to_output,
+            scale_expand_dims=scale_expand_dims,
+            num_bits=bits,
             symmetric=symmetric,
-            original_dtype=x.dtype,
+            dequantized_dtype=x.dtype,
             scale_dtype=scale_dtype,
         )
 
@@ -139,9 +178,9 @@ def quantize(
             quant_init = jax.nn.initializers.zeros
             scale_init = jax.nn.initializers.ones
         else:
-            quant_init = (int8_quant_init,)
+            quant_init = int8_quant_init
             scale_init = int8_scale_init
-        qvalue = dataclasses.replace(
+        quantized_value = dataclasses.replace(
             x,
             shape=x.shape,
             dtype=jnp.int8,
@@ -149,43 +188,49 @@ def quantize(
         )
         scale = ParamSpec(
             shape=new_shape,
-            dtype=scale_dtype,
+            dtype=jnp.dtype(scale_dtype),
             logical_axes=new_logical_axes,
             initializer=scale_init,
         )
         return QArray(
-            qvalue=qvalue,
+            quantized_value=quantized_value,
             scale=scale,
-            axis=axis,
-            bits=bits,
+            reduction_axes=axis,
+            scale_applied_to_output=scale_applied_to_output,
+            scale_expand_dims=scale_expand_dims,
+            num_bits=bits,
             symmetric=symmetric,
-            original_dtype=x.dtype,
+            dequantized_dtype=x.dtype,
             scale_dtype=jnp.dtype(scale_dtype),
         )
     raise ValueError(f"quantize got unexpected type: {type(x)}")
 
 
 def dequantize_array(x: QArray, dtype=None) -> jax.Array:
-    out_dtype = x.original_dtype if dtype is None else dtype
-    qvalue = x.qvalue.astype(jnp.float32)
-    scale = x.scale.astype(jnp.float32)
+    out_dtype = x.dequantized_dtype if dtype is None else dtype
+    quantized_value = x.quantized_value.astype(out_dtype)
+    scale = x.scale.astype(out_dtype)
+    scale = scale.reshape(
+        scale_shape_for_reduction_axes(x.scale, x.ndim, x.reduction_axes)
+    )
+    out = quantized_value * scale
+    return out.astype(out_dtype)
+
+
+def scale_shape_for_reduction_axes(
+    scale: jax.Array | ParamSpec,
+    original_ndim: int,
+    reduction_axes: tuple[int, ...],
+) -> tuple[int, ...]:
     full_scale_shape = []
     scale_idx = 0
-    for dim in range(qvalue.ndim):
-        if dim in x.axis:
+    for dim in range(original_ndim):
+        if dim in reduction_axes:
             full_scale_shape.append(1)
         else:
             full_scale_shape.append(scale.shape[scale_idx])
             scale_idx += 1
-    scale = scale.reshape(full_scale_shape)
-    out = qvalue * scale
-    return out.astype(out_dtype)
-
-
-def maybe_dequantize(x):
-    if isinstance(x, QArray):
-        return dequantize_array(x)
-    return x
+    return tuple(full_scale_shape)
 
 
 def default_ptq_rules(include_embeddings: bool = False) -> list[QuantizationRule]:
@@ -197,7 +242,7 @@ def default_ptq_rules(include_embeddings: bool = False) -> list[QuantizationRule
         r"(^|.*\.)wo$",
     ]
     if not include_embeddings:
-        patterns[0] = r"^(?!(?:.*\.)?embed\.weight$).*weight$"
+        patterns[0] = r"^(?!(?:.*\.)?embed\.weight$)(?:^|.*\.)weight$"
     return [QuantizationRule(pattern=pattern) for pattern in patterns]
 
 
@@ -233,6 +278,8 @@ def quantize_params(
             qleaf = quantize(
                 leaf,
                 axis=axis,
+                scale_applied_to_output=rule.scale_applied_to_output,
+                scale_expand_dims=rule.scale_expand_dims,
                 bits=rule.bits,
                 symmetric=rule.symmetric,
                 scale_dtype=rule.scale_dtype,
@@ -258,7 +305,7 @@ def _leaf_nbytes(leaf) -> int:
         return 0
 
     if isinstance(leaf, QArray):
-        total = _leaf_nbytes(leaf.qvalue) + _leaf_nbytes(leaf.scale)
+        total = _leaf_nbytes(leaf.quantized_value) + _leaf_nbytes(leaf.scale)
         return total
 
     if isinstance(leaf, ParamSpec):
