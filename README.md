@@ -38,7 +38,6 @@ The models here can be trained with both `AdamW` and `Muon` optimizers (via Opta
 - [x] Post Training Quantization (Weights only int8 quantization for now)
 - [ ] Reinforcement learning on a dataset
 - [ ] Speculative Decoding
-- [ ] Quantization
 - [ ] MoE example
 
 <br>
