@@ -14,7 +14,7 @@ from utils import layer_repr
 from utils import ParamInitializer
 from utils import jax_pytree_struct
 from layers import Embedding, Linear, GroupedQueryAttention
-from quantization import QArray, maybe_dequantize
+from quantization import QArray
 
 
 if jax.default_backend() == "gpu":
@@ -80,6 +80,55 @@ def compute_layer_configs(window_pattern, num_layers, short_window, nope_global=
     local_window_sizes[-1] = None
     rope_flags[-1] = not nope_global
     return local_window_sizes, rope_flags
+
+
+def _einsum_kwargs(out_sharding=None, precision=None, preferred_element_type=None):
+    kwargs = {}
+    if out_sharding is not None:
+        kwargs["out_sharding"] = out_sharding
+    if precision is not None:
+        kwargs["precision"] = precision
+    if preferred_element_type is not None:
+        kwargs["preferred_element_type"] = preferred_element_type
+    return kwargs
+
+
+def einsum(
+    subscripts: str,
+    lhs: jax.Array,
+    rhs: jax.Array | QArray,
+    *,
+    out_sharding=None,
+    precision=None,
+    preferred_element_type=None,
+):
+    """`jnp.einsum` wrapper that accepts dense arrays or `QArray` operands.
+
+    The LHS must be dense. The RHS may be dense or quantized. Scale placement is
+    intentionally simple and follows the static metadata on `QArray`: apply the
+    scale after the contraction when `scale_applied_to_output=True`, otherwise
+    multiply it into the LHS before the contraction.
+    """
+
+    kwargs = _einsum_kwargs(
+        out_sharding=out_sharding,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
+
+    if isinstance(lhs, QArray):
+        raise ValueError("einsum expects a dense LHS and an optional QArray RHS.")
+
+    if isinstance(rhs, QArray):
+        scale = jnp.expand_dims(rhs.scale, rhs.scale_expand_dims)
+        quantized_rhs = rhs.quantized_value.astype(lhs.dtype)
+        if rhs.scale_applied_to_output:
+            out = jnp.einsum(subscripts, lhs, quantized_rhs, **kwargs)
+            return (out * scale).astype(out.dtype)
+        scaled_lhs = (lhs * scale).astype(lhs.dtype)
+        return jnp.einsum(subscripts, scaled_lhs, quantized_rhs, **kwargs)
+
+    return jnp.einsum(subscripts, lhs, rhs, **kwargs)
 
 
 @jax_pytree_struct
@@ -159,10 +208,10 @@ def count_params(model):
         if leaf is None:
             continue
         if isinstance(leaf, QArray):
-            if hasattr(leaf.qvalue, "size"):
-                total += leaf.qvalue.size
+            if hasattr(leaf.quantized_value, "size"):
+                total += leaf.quantized_value.size
             else:
-                total += math.prod(leaf.qvalue.shape)
+                total += math.prod(leaf.quantized_value.shape)
         else:
             total += leaf.size
     return total
@@ -201,7 +250,14 @@ def calculate_rope(x: jax.Array, sin: jax.Array, cos: jax.Array) -> jax.Array:
 
 
 def embedding_forward(params, x):
-    weight = maybe_dequantize(params.weight)
+    weight = params.weight
+    if isinstance(weight, QArray):
+        quantized_rows = weight.quantized_value.at[x, :].get()
+        scale_rows = weight.scale.at[x].get()
+        rows = quantized_rows.astype(weight.dequantized_dtype) * scale_rows[
+            ..., None
+        ].astype(weight.dequantized_dtype)
+        return rows.astype(weight.dequantized_dtype)
     return weight.at[x, :].get()
 
 
@@ -213,8 +269,8 @@ def rmsnorm_forward(x, eps=1e-5):
 
 
 def linear_forward(params, x):
-    weight = maybe_dequantize(params.weight)
-    out = jnp.einsum("...d, dv-> ...v", x, weight)
+    weight = params.weight
+    out = einsum("...d,dv->...v", x, weight)
     if params.bias is not None:
         return out + params.bias
     else:
@@ -242,12 +298,9 @@ def attn_forward(params, x, mask, freqs, use_rope, local_window_size):
     sin, cos = freqs
 
     with jax.named_scope("qkv_matmul"):
-        wq = maybe_dequantize(params.wq)
-        wk = maybe_dequantize(params.wk)
-        wv = maybe_dequantize(params.wv)
-        q = jnp.einsum("btd, dhq -> bthq", x, wq)
-        k = jnp.einsum("btd, dhq -> bthq", x, wk)
-        v = jnp.einsum("btd, dhq -> bthq", x, wv)
+        q = einsum("btd,dhq->bthq", x, params.wq)
+        k = einsum("btd,dhq->bthq", x, params.wk)
+        v = einsum("btd,dhq->bthq", x, params.wv)
 
     with jax.named_scope("qk_norm"):
         q = rmsnorm_forward(q)
@@ -283,8 +336,7 @@ def attn_forward(params, x, mask, freqs, use_rope, local_window_size):
             ).astype(orig_dtype)
 
     with jax.named_scope("projection"):
-        wo = maybe_dequantize(params.wo)
-        out = jnp.einsum("bthq, hqd->btd", attn, wo)
+        out = einsum("bthq,hqd->btd", attn, params.wo)
     return out
 
 
@@ -360,12 +412,9 @@ def attn_forward_infer(
     sin, cos = freqs
 
     with jax.named_scope("qkv_matmul"):
-        wq = maybe_dequantize(params.wq)
-        wk = maybe_dequantize(params.wk)
-        wv = maybe_dequantize(params.wv)
-        q = jnp.einsum("btd, dhq -> bthq", x, wq)
-        k = jnp.einsum("btd, dhq -> bthq", x, wk)
-        v = jnp.einsum("btd, dhq -> bthq", x, wv)
+        q = einsum("btd,dhq->bthq", x, params.wq)
+        k = einsum("btd,dhq->bthq", x, params.wk)
+        v = einsum("btd,dhq->bthq", x, params.wv)
 
     with jax.named_scope("qk_norm"):
         q = rmsnorm_forward(q)
@@ -415,8 +464,7 @@ def attn_forward_infer(
         ).astype(orig_dtype)
 
     with jax.named_scope("projection"):
-        wo = maybe_dequantize(params.wo)
-        out = jnp.einsum("bthq, hqd->btd", attn, wo)
+        out = einsum("bthq,hqd->btd", attn, params.wo)
     return out, cache_updates
 
 
