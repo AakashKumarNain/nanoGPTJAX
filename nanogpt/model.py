@@ -15,6 +15,7 @@ from utils import ParamInitializer
 from utils import jax_pytree_struct
 from layers import Embedding, Linear, GroupedQueryAttention
 from quantization import QArray
+from config import USE_CHUNKED_CE
 
 
 if jax.default_backend() == "gpu":
@@ -385,13 +386,16 @@ def forward(params, x, segment_ids, freqs):
     with jax.named_scope("norm"):
         x = rmsnorm_forward(x)
 
-    with jax.named_scope("unembed"):
-        logits = linear_forward(params.lm_head, x)
+    if USE_CHUNKED_CE:
+        return x
+    else:
+        with jax.named_scope("unembed"):
+            logits = linear_forward(params.lm_head, x)
 
-    with jax.named_scope("logit_soft_capping"):
-        logits = logits.astype(jnp.float32)
-        logits = 15.0 * jnp.tanh(logits / 15.0)
-    return logits
+        with jax.named_scope("logit_soft_capping"):
+            logits = logits.astype(jnp.float32)
+            logits = 15.0 * jnp.tanh(logits / 15.0)
+        return logits
 
 
 ############## Inference: with new simplified KVCache implementation ##############
