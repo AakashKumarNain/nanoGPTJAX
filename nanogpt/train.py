@@ -1,22 +1,4 @@
 import os
-# Set some GPU FLAGS
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-os.environ["NCCL_NVLS_ENABLE"]="1"
-os.environ.update({
-  "NCCL_LL128_BUFFSIZE": "-2",
-  "NCCL_LL_BUFFSIZE": "-2",
-   "NCCL_PROTO": "SIMPLE,LL,LL128",
- })
-os.environ['XLA_FLAGS'] = (
-    '--xla_gpu_triton_gemm_any=True '
-    '--xla_gpu_enable_latency_hiding_scheduler=true '
-    '--xla_gpu_enable_pipelined_all_reduce=true '
-    '--xla_gpu_enable_pipelined_all_gather=true '
-    '--xla_gpu_enable_pipelined_reduce_scatter=true '
-    '--xla_gpu_enable_while_loop_double_buffering=true '
-    '--xla_gpu_enable_pipelined_p2p=true '
-    '--xla_gpu_collective_permute_decomposer_threshold=1024 '
-)
 import warnings
 import logging
 import time
@@ -24,6 +6,8 @@ from pathlib import Path
 from functools import partial
 
 import jax
+
+# For better performance on Hopper and Blackwell
 jax.config.update("jax_optimization_level", "O1")
 
 import optax
@@ -40,36 +24,58 @@ from model import precompute_frequencies
 from model import GPT, forward
 from utils import logical_to_sharding
 from optim import build_optimizer
-from config import ShardingRules, Config, BATCH_AXIS_NAME
+from config import ShardingRules, Config, BATCH_AXIS_NAME, USE_CHUNKED_CE, CHUNK_SIZE
 
 from fineweb_dataloader import make_grain_shard_loader, BOSFinder
-# from custom_loss import chunked_softmax_cross_entropy_with_integer_labels
+from chunked_ce_loss import linear_cross_entropy
 
 
 logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
 
 
-def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
-    logits = forward(params, x_batch, segment_ids, freqs)
-    if loss_mask is not None:
-        per_token_loss = optax.losses.softmax_cross_entropy_with_integer_labels(
-            logits=logits,
-            labels=y_batch,
-            where=loss_mask,
+def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask, mesh):
+    if USE_CHUNKED_CE:
+        hidden = forward(
+            params, x_batch, segment_ids, freqs
+        )  # [B, T, H], final norm applied, no LM head
+        return linear_cross_entropy(
+            hidden,
+            params.lm_head.weight,  # [H, V]; avoid a per-step .T if stored [V, H]
+            y_batch,  # already shifted targets, signed int
+            mask=None
+            if loss_mask is None
+            else loss_mask.astype(
+                bool
+            ),  # mean divides by active count, like your where=
+            ignore_index=None,  # Optax has no ignore index; keep parity
+            soft_cap=15.0,  # remove the soft cap from forward_hidden
+            logits_dtype="input",  # matches a bf16 projection cast to FP32
+            reduction="mean",
+            mesh=mesh,  # None on one GPU
+            batch_axis=BATCH_AXIS_NAME,  # your data-parallel mesh axis name
+            chunk_tokens=CHUNK_SIZE,
         )
-        return jnp.sum(per_token_loss) / jnp.maximum(jnp.sum(loss_mask), 1.0)
     else:
-        return jnp.mean(
-            optax.losses.softmax_cross_entropy_with_integer_labels(
-                logits=logits, labels=y_batch
+        logits = forward(params, x_batch, segment_ids, freqs)
+        if loss_mask is not None:
+            per_token_loss = optax.losses.softmax_cross_entropy_with_integer_labels(
+                logits=logits,
+                labels=y_batch,
+                where=loss_mask,
             )
-        )
+            return jnp.sum(per_token_loss) / jnp.maximum(jnp.sum(loss_mask), 1.0)
+        else:
+            return jnp.mean(
+                optax.losses.softmax_cross_entropy_with_integer_labels(
+                    logits=logits, labels=y_batch
+                )
+            )
 
 
 @partial(
     jax.jit,
-    static_argnames=("optim", "grad_accum_steps"),
+    static_argnames=("optim", "grad_accum_steps", "mesh"),
     donate_argnames=("params", "x_batch", "y_batch", "optim_state"),
 )
 def train_step_accum(
@@ -82,12 +88,13 @@ def train_step_accum(
     optim_state,
     optim,
     grad_accum_steps,
+    mesh,
 ):
     def body(carry, xy):
         param, opt_state, lsum = carry
         xb, yb = xy
         loss, grad = jax.value_and_grad(compute_loss)(
-            param, xb, yb, segment_ids, freqs, loss_mask
+            param, xb, yb, segment_ids, freqs, loss_mask, mesh
         )
 
         # MultiSteps accumulates grad internally and returns a zero-tree update on
@@ -106,11 +113,19 @@ def train_step_accum(
 
 @partial(
     jax.jit,
-    static_argnames=("optim",),
+    static_argnames=("optim", "mesh"),
     donate_argnames=("params", "x_batch", "y_batch", "optim_state"),
 )
 def train_step(
-    params, x_batch, y_batch, segment_ids, freqs, loss_mask, optim_state, optim
+    params,
+    x_batch,
+    y_batch,
+    segment_ids,
+    freqs,
+    loss_mask,
+    optim_state,
+    optim,
+    mesh=None,
 ):
     loss, grads = jax.value_and_grad(compute_loss)(
         params, x_batch, y_batch, segment_ids, freqs, loss_mask
@@ -120,10 +135,9 @@ def train_step(
     return updated_params, loss, optim_state
 
 
-@jax.jit
-def val_step(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
-    loss = compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask)
-    return loss
+@partial(jax.jit, static_argnames=("mesh",))
+def val_step(params, x_batch, y_batch, segment_ids, freqs, loss_mask, mesh):
+    return compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask, mesh)
 
 
 def line(label, value, comma=False, label_w=30, colon_w=2, value_w=20):
@@ -184,7 +198,6 @@ def model_run_name(cfg):
         f"_V{cfg.model.vocab_size}"
         f"_{cfg.model.window_pattern}"
     )
-
 
 
 def main():
@@ -251,7 +264,6 @@ def main():
 
     optim_state = optim.init(model)
 
-
     print("")
     print("-" * 75)
     print("")
@@ -276,7 +288,6 @@ def main():
     print(line("Warmup steps", cfg.hparams.warmup_steps))
     print(line("Weight decay", cfg.hparams.weight_decay), "\n")
     print("-" * 75)
-
 
     # Checkpointing
     ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir) / model_run_name(cfg)
@@ -317,7 +328,9 @@ def main():
             )
         else:
             resume_from_step = 0
-            print(f"Checkpoint path {resume_ckpt_path} not found! Resuming training without restoring checkpoint...")
+            print(
+                f"Checkpoint path {resume_ckpt_path} not found! Resuming training without restoring checkpoint..."
+            )
 
     best_loss = float("inf")
     last_val_loss = float("inf")
@@ -397,6 +410,7 @@ def main():
                             optim_state,
                             optim,
                             grad_accum_steps,
+                            mesh,
                         )
                     else:
                         starts, ends = bf.next_batch(bsz, seqlen)
@@ -422,6 +436,7 @@ def main():
                             None,
                             optim_state,
                             optim,
+                            mesh=cfg.mesh,
                         )
 
                     # Block for accurate timing
@@ -498,11 +513,14 @@ def main():
                                 curr_val_data = jnp.asarray(val_data_buf, dtype=jnp.int32, device=data_sharding)  # fmt: off
                                 x = curr_val_data[:, :-1]
                                 y = curr_val_data[:, 1:]
-                                loss = val_step(model, x, y, segment_ids, freqs, None)
+                                loss = val_step(
+                                    model, x, y, segment_ids, freqs, None, mesh=cfg.mesh
+                                )
                                 val_loss += loss.item()
                                 val_steps_count += 1
                         finally:
-                            val_tokens.unlink_on_del()
+                            if hasattr(val_tokens, "unlink_on_del"):
+                                val_tokens.unlink_on_del()
                     avg_val_loss = val_loss / val_steps_count
                     avg_val_loss = jax.block_until_ready(avg_val_loss)
                     improved = avg_val_loss < best_loss
@@ -528,7 +546,8 @@ def main():
                     print(f"Best loss     : {best_loss:.4f} at step {best_step}\n")
                     last_val_loss = avg_val_loss
         finally:
-            tokens.unlink_on_del()
+            if hasattr(tokens, "unlink_on_del"):
+                tokens.unlink_on_del()
     train_end_time = time.time()
     print(f"\nTotal time taken to train the model: {(train_end_time - train_start_time)/60:.2f} minutes")  # fmt: off
 
