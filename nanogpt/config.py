@@ -21,6 +21,10 @@ TENSOR_ONLY_AXIS_NAME = "y"
 ATTN_HEADS_AXIS_NAME = "y"
 TENSOR_AXIS_NAME = ("y", "z")
 
+# Chunked Cross-entropy
+USE_CHUNKED_CE = True
+CHUNK_SIZE = 4096
+
 
 def init_uniform(scale=1.0):
     def kernel_init(key, shape, dtype):
