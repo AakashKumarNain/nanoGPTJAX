@@ -15,7 +15,7 @@ from utils import ParamInitializer
 from utils import jax_pytree_struct
 from layers import Embedding, Linear, GroupedQueryAttention
 from quantization import QArray
-from config import USE_CHUNKED_CE
+from config import USE_CHUNKED_CE, ENABLE_ACTIVATION_CKPT
 
 
 if jax.default_backend() == "gpu":
@@ -283,6 +283,14 @@ def mlp_forward(params, x):
     x = jnp.square(jax.nn.relu(x))
     x = linear_forward(params.fc2, x)
     return x
+
+
+if ENABLE_ACTIVATION_CKPT:
+    mlp_forward = jax.checkpoint(
+        mlp_forward,
+        policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+        prevent_cse=True,
+    )
 
 
 # Though we can combine the cache update this in this block. I keep two versions
