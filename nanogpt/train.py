@@ -2,6 +2,7 @@ import os
 import warnings
 import logging
 import time
+import math
 from pathlib import Path
 from functools import partial
 
@@ -32,6 +33,59 @@ from chunked_ce_loss import linear_cross_entropy
 
 logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
+
+
+def estimate_training_flops_per_token(
+    model,
+    seq_len,
+    *,
+    attention_counting="rectangular",
+):
+    """Matmul FLOPs for forward + backward; excludes recomputation.
+
+    Assumes full-parameter training and fixed-length sequences.
+    Does not account for additional segment masks or padding.
+    """
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive")
+    if attention_counting not in ("rectangular", "causal"):
+        raise ValueError("Use 'rectangular' or 'causal'")
+
+    # Include this even when the LM head runs inside chunked CE.
+    matmul_params = math.prod(model.lm_head.weight.shape)
+    attention_flops = 0.0
+
+    for block, window in zip(model.blocks, model.local_window_sizes, strict=True):
+        weights = (
+            block.attn.wq,
+            block.attn.wk,
+            block.attn.wv,
+            block.attn.wo,
+            block.mlp.fc1.weight,
+            block.mlp.fc2.weight,
+        )
+        matmul_params += sum(math.prod(w.shape) for w in weights)
+
+        # wq has shape [model_dim, query_heads, head_dim].
+        _, query_heads, head_dim = block.attn.wq.shape
+
+        if window is None:
+            width = seq_len
+        else:
+            left, right = window
+            if left < 0 or right != 0:
+                raise ValueError("Expected a nonnegative causal window")
+            # Left window counts past tokens; add self.
+            width = min(seq_len, left + 1)
+
+        keys_per_query = float(width)
+
+        if attention_counting == "causal":
+            # Average min(position + 1, width) over the sequence.
+            keys_per_query -= width * (width - 1) / (2 * seq_len)
+
+        attention_flops += 12 * query_heads * head_dim * keys_per_query
+    return 6 * matmul_params + attention_flops
 
 
 def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask, mesh):
@@ -130,7 +184,7 @@ def train_step(
     loss, grads = jax.value_and_grad(compute_loss)(
         params, x_batch, y_batch, segment_ids, freqs, loss_mask
     )
-    updates, optim_state = optim.update(grads, optim_state, params)
+    updates, optim_state = optim.update(grads, optim_state, params, mesh)
     updated_params = optax.apply_updates(params, updates)
     return updated_params, loss, optim_state
 
@@ -230,7 +284,7 @@ def main():
     min_lr = 0.01 * max_lr
     warmup_steps = cfg.hparams.warmup_steps
     desired_batch_size = cfg.hparams.desired_batch_size
-    grad_accum_steps = max(2, desired_batch_size // (bsz * seqlen))
+    grad_accum_steps = min(8, desired_batch_size // (bsz * seqlen))
     total_train_steps = cfg.hparams.total_train_steps
     max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
     checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
@@ -344,6 +398,15 @@ def main():
     grad_accum_batch = np.zeros((grad_accum_steps, bsz, seqlen + 1), dtype=np.uint16)
     val_data_buf = np.zeros((bsz, seqlen + 1), dtype=np.uint16)
 
+    # Calculate once for a fixed model and sequence length.
+    flops_per_token = estimate_training_flops_per_token(model, seqlen, attention_counting="rectangular")
+    
+    # This value is hardcoded here for H100. It depends on the underlying hardware. If you are
+    # running it on a different hardware, please change this accordingly.
+    # Units: FLOP/s per GPU; excludes structured sparsity.
+    peak_dense_flops_per_device = 989e12
+    total_peak_flops_per_second = jax.device_count() * peak_dense_flops_per_device
+
     step = resume_from_step
     print("Starting training (the first step will take some time for compilation...)\n")
 
@@ -447,8 +510,9 @@ def main():
                     tokens_processed = bsz * seqlen * grad_accum_steps
                     total_tokens_consumed += tokens_processed
                     tokens_per_sec = int(tokens_processed / dt)
+                    mfu = flops_per_token * tokens_per_sec / total_peak_flops_per_second
                     # fmt: off
-                    print(f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {loss:8.4f} | Step time: {dt:5.2f} s | Train time: {train_time_elapsed:6.2f} min | Tokens processed/s: {tokens_per_sec:>9,}")
+                    print(f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {loss:8.4f} | Step time: {dt:5.2f} s | Train time: {train_time_elapsed:6.2f} min | Tokens processed/s: {tokens_per_sec:>9,} MFU: {100 * mfu:.2f}%")
                     # fmt: on
 
                     step += 1
