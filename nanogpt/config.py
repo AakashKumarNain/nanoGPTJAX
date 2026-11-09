@@ -25,6 +25,11 @@ TENSOR_AXIS_NAME = ("y", "z")
 USE_CHUNKED_CE = True
 CHUNK_SIZE = 4096
 
+# Activation Checkpointing / Remat
+# We only use checkpointing for the MLP module. If you want to save more,
+# feel free to add more in the model file. 
+ENABLE_ACTIVATION_CKPT = True
+
 
 def init_uniform(scale=1.0):
     def kernel_init(key, shape, dtype):
